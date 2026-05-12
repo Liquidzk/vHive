@@ -6,10 +6,12 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"os"
 	"os/exec"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -38,7 +40,45 @@ var (
 	imageMap  map[string]string
 	relayPort = 0
 	mu        = &sync.Mutex{}
+
+	syncGuestClock       bool
+	guestClockSyncPort   string
+	guestClockSyncClient = &http.Client{Timeout: 50 * time.Millisecond}
 )
+
+func syncGuestClockToHost(guestIP string) error {
+	if !syncGuestClock || guestClockSyncPort == "" {
+		return nil
+	}
+
+	endpoint := "http://" + net.JoinHostPort(guestIP, guestClockSyncPort) + "/time-sync"
+	var lastErr error
+	for attempt := 0; attempt < 50; attempt++ {
+		hostUnix := strconv.FormatInt(time.Now().Unix(), 10)
+		req, err := http.NewRequest(http.MethodGet, endpoint, nil)
+		if err != nil {
+			return err
+		}
+		req.Header.Set("X-VHive-Host-Unix", hostUnix)
+		req.Header.Set("X-Khala-Host-Unix", hostUnix)
+		req.Close = true
+
+		resp, err := guestClockSyncClient.Do(req)
+		if err != nil {
+			lastErr = err
+		} else {
+			_, _ = io.Copy(io.Discard, resp.Body)
+			_ = resp.Body.Close()
+			if resp.StatusCode >= http.StatusOK && resp.StatusCode < http.StatusMultipleChoices {
+				return nil
+			}
+			lastErr = fmt.Errorf("guest clock sync returned HTTP %d", resp.StatusCode)
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+
+	return lastErr
+}
 
 func handler(w http.ResponseWriter, r *http.Request) {
 	log.Debugf("request received, image %s, revision %s", r.Header.Get("image"), r.Header.Get("revision"))
@@ -99,6 +139,12 @@ func handler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	vmId := resp.VMID
+
+	if err := syncGuestClockToHost(resp.GuestIP); err != nil {
+		log.Warnf("Failed to sync guest clock for VM %s (%s): %v", vmId, resp.GuestIP, err)
+	} else if syncGuestClock {
+		log.Debugf("Synced guest clock for VM %s (%s)", vmId, resp.GuestIP)
+	}
 
 	relayArgs := r.Header.Get("relayArgs")
 	endpoint := resp.GuestIP + ":50051"
@@ -179,7 +225,12 @@ func main() {
 	minioCredentials := flag.String("minioCredentials", "10.0.1.1:9000;minio;minio123", "Minio credentials for uploading/downloading remote firecracker snapshots. Format: <minioAddr>;<minioAccessKey>;<minioSecretKey>")
 	endpoint := flag.String("endpoint", "localhost:8080", "Endpoint for the relay server")
 	chunkSize := flag.Uint64("chunkSize", 512*1024, "Chunk size in bytes for memory file uploads and downloads when chunking is enabled")
+	syncGuestClockFlag := flag.Bool("syncGuestClock", false, "Synchronize the guest clock with the relay host before proxying each invocation")
+	guestClockSyncPortFlag := flag.String("guestClockSyncPort", "18080", "Guest TCP port used by the lightweight clock-sync HTTP hook")
 	flag.Parse()
+
+	syncGuestClock = *syncGuestClockFlag
+	guestClockSyncPort = *guestClockSyncPortFlag
 
 	imageMap = make(map[string]string)
 	data, err := os.ReadFile("image_map.json")
