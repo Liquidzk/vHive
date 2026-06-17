@@ -123,12 +123,20 @@ gofmt -w memory/manager
 
 ## Step 3: Use Mappings When Serving Page Faults
 
+Status: complete.
+
 Goal: make full-memory-file page fault serving use Firecracker mapping offsets.
 
 Files expected:
 
 - `memory/manager/snapshot_state.go`
 - `memory/manager/*_test.go`
+
+Files updated:
+
+- `memory/manager/snapshot_state.go`
+- `memory/manager/uffd_mapping.go`
+- `memory/manager/uffd_mapping_test.go`
 
 Implementation:
 
