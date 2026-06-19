@@ -167,6 +167,8 @@ gofmt -w memory/manager
 
 ## Step 4: Cleanup And Regression Pass
 
+Status: complete.
+
 Goal: remove dead legacy assumptions where safe and verify the complete patch.
 
 Files expected:
@@ -193,6 +195,13 @@ gofmt -w memory/manager
 git diff --stat
 git diff
 ```
+
+Validation notes:
+
+- `go test ./memory/manager` passes.
+- `go test ./...` requires the broader vHive integration test environment. In
+  this workspace it fails in existing tests that need privileged network setup,
+  `/fccd/snapshots`, `/fccd/test/snapshots`, or live CRI endpoints.
 
 ## Integration Check After Manager Patch
 
