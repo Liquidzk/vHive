@@ -241,6 +241,8 @@ Adopt:
   (`v1.13.1`).
 - `bin/firecracker-containerd` and `bin/containerd-shim-aws-firecracker` from
   the same reference stack (`containerd 1.6.20+unknown`).
+- The Firecracker 1.13 guest boot configuration used by the reference stack:
+  `acpi=off`, serial console output, and 512 MiB guest memory.
 - The mapping-based offset rule fixed in the prototype:
   `region.Offset + (faultPageAddr - region.BaseHostVirtAddr)`.
 - Non-fatal UFFD loop handling for transient or shutdown-related errors such as
