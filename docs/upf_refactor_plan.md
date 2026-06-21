@@ -219,3 +219,41 @@ Items to confirm:
 
 Keep this check small and avoid modifying `cmd/snap_bench.go` or runtime log
 configuration.
+
+## Version Alignment Follow-up
+
+Status: in progress.
+
+Goal: align the local runtime binaries with the reference UPF implementation
+without copying the standalone prototype handler.
+
+Reference commits:
+
+- `fd7e83a745398d208c7ef3236623ee0d1e97f51c`: adds the prototype UFFD handler.
+- `2fea4fb752dd123852d23732b9bf1fcfaa0ad2ff`: bumps the Firecracker runtime
+  stack used by that handler.
+- `3963547a666d7c06fbe9e4281fe428d6e905fbdf`: fixes mapping-based UFFD offset
+  handling in the prototype handler.
+
+Adopt:
+
+- `bin/firecracker` and `bin/jailer` from the reference stack
+  (`v1.13.1`).
+- `bin/firecracker-containerd` and `bin/containerd-shim-aws-firecracker` from
+  the same reference stack (`containerd 1.6.20+unknown`).
+- The mapping-based offset rule fixed in the prototype:
+  `region.Offset + (faultPageAddr - region.BaseHostVirtAddr)`.
+- Non-fatal UFFD loop handling for transient or shutdown-related errors such as
+  `EINTR`, `EAGAIN`, and `EBADF`.
+
+Do not adopt:
+
+- The standalone `uffd_handler/` directory.
+- `cmd/snap_bench.go` benchmark/debug changes.
+- Runtime log-level changes.
+- Experimental working-set, balloon, or trace behavior outside the basic full
+  guest memory file path.
+
+The current Go module still uses the integrated `memory/manager` handler and a
+newer firecracker-containerd proto package whose `MemBackend` field number is
+compatible with the reference binary protocol.
