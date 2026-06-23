@@ -3,6 +3,9 @@
 This document describes how to validate the UPF/UFFD memory restore path after
 vHive has already been deployed with InVitro.
 
+If a deployment is needed, use the InVitro branch at
+https://github.com/Liquidzk/invitro/tree/likun/upf-validation-deploy.
+
 Assumptions:
 
 * The target vHive branch is already deployed on the nodes.
