@@ -62,9 +62,10 @@ func WithSnapshotsDir(snapshotsDir string) OrchestratorOption {
 	}
 }
 
-// WithLazyMode is kept for compatibility with legacy callers.
+// WithLazyMode Sets the lazy paging mode on or off.
 func WithLazyMode(isLazyMode bool) OrchestratorOption {
 	return func(o *Orchestrator) {
+		o.isLazyMode = isLazyMode
 	}
 }
 
