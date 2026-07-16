@@ -64,9 +64,8 @@ func TestMain(m *testing.M) {
 	log.SetLevel(log.InfoLevel)
 
 	flag.Parse()
-
-	if *isUPFEnabledTest {
-		log.Error("User-level page faults are temporarily disabled (gh-807)")
+	if *isUPFEnabledTest && !*isLazyModeTest {
+		log.Error("User-level page faults currently require lazy serving mode")
 		os.Exit(-1)
 	}
 

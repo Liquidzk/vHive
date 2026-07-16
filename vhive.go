@@ -93,13 +93,12 @@ func main() {
 		return
 	}
 
-	if *isUPFEnabled {
-		log.Error("User-level page faults are temporarily disabled (gh-807)")
-		return
-	}
-
 	if *isUPFEnabled && !*isSnapshotsEnabled {
 		log.Error("User-level page faults are not supported without snapshots")
+		return
+	}
+	if *isUPFEnabled && !*isLazyMode {
+		log.Error("User-level page faults currently require lazy serving mode")
 		return
 	}
 

@@ -24,187 +24,187 @@ package manager
 
 import (
 	"encoding/csv"
+	"errors"
+	"fmt"
+	"io"
 	"os"
 	"sort"
 	"strconv"
 	"sync"
-
-	log "github.com/sirupsen/logrus"
 )
 
-// Record A tuple with an address
+// Record identifies one guest memory page by its offset in the full memory file.
 type Record struct {
 	offset uint64
 }
 
-// Trace Contains records
+// Trace stores recorded guest memory page offsets and replay regions.
 type Trace struct {
 	sync.Mutex
 	traceFileName string
 
-	containedOffsets map[uint64]int
+	pageSize         uint64
+	containedOffsets map[uint64]struct{}
 	trace            []Record
 	regions          map[uint64]int
 }
 
 func initTrace(traceFileName string) *Trace {
-	t := new(Trace)
-
-	t.traceFileName = traceFileName
-	t.regions = make(map[uint64]int)
-	t.containedOffsets = make(map[uint64]int)
-	t.trace = make([]Record, 0)
-
-	return t
+	return &Trace{
+		traceFileName:    traceFileName,
+		containedOffsets: make(map[uint64]struct{}),
+		trace:            make([]Record, 0),
+		regions:          make(map[uint64]int),
+	}
 }
 
-// AppendRecord Appends a record to the trace
 func (t *Trace) AppendRecord(r Record) {
 	t.Lock()
 	defer t.Unlock()
 
+	if _, ok := t.containedOffsets[r.offset]; ok {
+		return
+	}
 	t.trace = append(t.trace, r)
-	t.containedOffsets[r.offset] = 0
+	t.containedOffsets[r.offset] = struct{}{}
 }
 
-// WriteTrace Writes all the records to a file
-func (t *Trace) WriteTrace() {
+func (t *Trace) WriteTrace() error {
 	t.Lock()
 	defer t.Unlock()
 
 	file, err := os.Create(t.traceFileName)
 	if err != nil {
-		log.Fatalf("Failed to open trace file for writing: %v", err)
+		return err
 	}
 	defer func() { _ = file.Close() }()
 
 	writer := csv.NewWriter(file)
-	defer writer.Flush()
-
 	for _, rec := range t.trace {
-		err := writer.Write([]string{
-			strconv.FormatUint(rec.offset, 16)})
-		if err != nil {
-			log.Fatalf("Failed to write trace: %v", err)
+		if err := writer.Write([]string{strconv.FormatUint(rec.offset, 16)}); err != nil {
+			return err
 		}
 	}
+	writer.Flush()
+	return writer.Error()
 }
 
-// readTrace Reads all the records from a CSV file
-//
 //nolint:unused
-func (t *Trace) readTrace() {
+func (t *Trace) readTrace() error {
 	f, err := os.Open(t.traceFileName)
 	if err != nil {
-		log.Fatalf("Failed to open trace file for reading: %v", err)
+		return err
 	}
 	defer func() { _ = f.Close() }()
 
 	lines, err := csv.NewReader(f).ReadAll()
 	if err != nil {
-		log.Fatalf("Failed to read from the trace file: %v", err)
+		return err
 	}
 
 	for _, line := range lines {
-		rec := readRecord(line)
+		rec, err := readRecord(line)
+		if err != nil {
+			return err
+		}
 		t.AppendRecord(rec)
 	}
+	return nil
 }
 
-// readRecord Parses a record from a line
-//
 //nolint:unused
-func readRecord(line []string) Record {
+func readRecord(line []string) (Record, error) {
+	if len(line) == 0 {
+		return Record{}, errors.New("empty trace record")
+	}
 	offset, err := strconv.ParseUint(line[0], 16, 64)
 	if err != nil {
-		log.Fatalf("Failed to convert string to offset: %v", err)
+		return Record{}, err
 	}
 
-	rec := Record{
-		offset: offset,
-	}
-	return rec
+	return Record{offset: offset}, nil
 }
 
-// Search trace for the record with the same offset
 func (t *Trace) containsRecord(rec Record) bool {
 	_, ok := t.containedOffsets[rec.offset]
-
 	return ok
 }
 
-// ProcessRecord Prepares the trace, the regions map, and the working set file for replay
-// Must be called when record is done (i.e., it is not concurrency-safe vs. AppendRecord)
-func (t *Trace) ProcessRecord(GuestMemPath, WorkingSetPath string) {
-	log.Debug("Preparing replay structures")
+func (t *Trace) ProcessRecord(guestMemPath, workingSetPath string, pageSize uint64) error {
+	if pageSize == 0 {
+		return errInvalidGuestRegionPageSize
+	}
 
-	// sort trace records in the ascending order by offset
+	t.Lock()
+	defer t.Unlock()
+
+	t.pageSize = pageSize
 	sort.Slice(t.trace, func(i, j int) bool {
 		return t.trace[i].offset < t.trace[j].offset
 	})
 
-	// build the map of contiguous regions from the trace records
-	var last, regionStart uint64
-	for _, rec := range t.trace {
-		if rec.offset != last+uint64(os.Getpagesize()) {
+	t.regions = make(map[uint64]int)
+	var (
+		last        uint64
+		regionStart uint64
+	)
+	for i, rec := range t.trace {
+		if i == 0 || rec.offset != last+pageSize {
 			regionStart = rec.offset
 			t.regions[regionStart] = 1
 		} else {
 			t.regions[regionStart]++
 		}
-
 		last = rec.offset
 	}
 
-	t.writeWorkingSetPagesToFile(GuestMemPath, WorkingSetPath)
+	return t.writeWorkingSetPagesToFileLocked(guestMemPath, workingSetPath, pageSize)
 }
 
-func (t *Trace) writeWorkingSetPagesToFile(guestMemFileName, WorkingSetPath string) {
-	log.Debug("Writing the working set pages to a disk")
-
-	fSrc, err := os.Open(guestMemFileName)
+func (t *Trace) writeWorkingSetPagesToFileLocked(guestMemPath, workingSetPath string, pageSize uint64) error {
+	fSrc, err := os.Open(guestMemPath)
 	if err != nil {
-		log.Fatalf("Failed to open guest memory file for reading")
+		return err
 	}
 	defer func() { _ = fSrc.Close() }()
-	fDst, err := os.Create(WorkingSetPath)
+
+	fDst, err := os.Create(workingSetPath)
 	if err != nil {
-		log.Fatalf("Failed to open ws file for writing")
+		return err
 	}
 	defer func() { _ = fDst.Close() }()
 
-	var (
-		dstOffset int64
-		count     int
-	)
-
-	// Form a sorted slice of keys to access the map in a predetermined order
-	keys := make([]uint64, 0)
+	keys := make([]uint64, 0, len(t.regions))
 	for k := range t.regions {
 		keys = append(keys, k)
 	}
 	sort.Slice(keys, func(i, j int) bool { return keys[i] < keys[j] })
 
+	var dstOffset int64
 	for _, offset := range keys {
-		regLength := t.regions[offset]
-		copyLen := regLength * os.Getpagesize()
-
-		buf := make([]byte, copyLen)
-
-		if n, err := fSrc.ReadAt(buf, int64(offset)); n != copyLen || err != nil {
-			log.Fatalf("Read file failed for src")
+		copyLen := uint64(t.regions[offset]) * pageSize
+		if copyLen > uint64(int(^uint(0)>>1)) {
+			return fmt.Errorf("working set region too large: %#x", copyLen)
 		}
 
-		if n, err := fDst.WriteAt(buf, dstOffset); n != copyLen || err != nil {
-			log.Fatalf("Write file failed for dst")
+		buf := make([]byte, int(copyLen))
+		n, err := fSrc.ReadAt(buf, int64(offset))
+		if err != nil && err != io.EOF {
+			return err
+		}
+		if n != len(buf) {
+			return io.ErrUnexpectedEOF
 		}
 
+		n, err = fDst.WriteAt(buf, dstOffset)
+		if err != nil {
+			return err
+		}
+		if n != len(buf) {
+			return io.ErrShortWrite
+		}
 		dstOffset += int64(copyLen)
-
-		count += regLength
 	}
 
-	if err := fDst.Sync(); err != nil {
-		log.Fatalf("Sync file failed for dst")
-	}
+	return fDst.Sync()
 }

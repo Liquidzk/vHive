@@ -22,31 +22,17 @@
 
 package manager
 
-/*
-#include "user_page_faults.h"
-*/
-import "C"
-
 import (
-	"context"
-	"encoding/binary"
-	"errors"
 	"fmt"
-	"net"
+	"io"
 	"os"
 	"path/filepath"
-	"sort"
 	"sync"
-	"syscall"
-	"time"
 
-	"github.com/ftrvxmtrx/fd"
 	log "github.com/sirupsen/logrus"
 	"golang.org/x/sys/unix"
 
 	"github.com/vhive-serverless/vhive/metrics"
-
-	"unsafe"
 )
 
 // SnapshotStateCfg Config to initialize SnapshotState
@@ -67,12 +53,14 @@ type SnapshotStateCfg struct {
 // of the VM.
 type SnapshotState struct {
 	SnapshotStateCfg
-	firstPageFaultOnce *sync.Once // to initialize the start virtual address and replay
-	startAddress       uint64
-	userFaultFD        *os.File
-	trace              *Trace
-	epfd               int
-	quitCh             chan int
+	firstPageFaultOnce  *sync.Once
+	userFaultFD         *os.File
+	guestRegionMappings []GuestRegionUffdMapping
+	trace               *Trace
+	epfd                int
+	wakeFD              int
+	quitCh              chan int
+	pollDoneCh          chan struct{}
 
 	// to indicate whether the instance has even been activated. this is to
 	// get around cases where offload is called for the first time
@@ -91,7 +79,7 @@ type SnapshotState struct {
 	reusedPFServed []float64
 	latencyMetrics []*metrics.Metric
 
-	replayedNum   int // only valid for lazy serving
+	replayedNum   int
 	uniqueNum     int
 	currentMetric *metrics.Metric
 }
@@ -99,6 +87,7 @@ type SnapshotState struct {
 // NewSnapshotState Initializes a snapshot state
 func NewSnapshotState(cfg SnapshotStateCfg) *SnapshotState {
 	s := new(SnapshotState)
+	cfg = normalizeSnapshotStateCfg(cfg)
 	s.SnapshotStateCfg = cfg
 
 	s.trace = initTrace(s.getTraceFile())
@@ -112,65 +101,99 @@ func NewSnapshotState(cfg SnapshotStateCfg) *SnapshotState {
 	return s
 }
 
+func normalizeSnapshotStateCfg(cfg SnapshotStateCfg) SnapshotStateCfg {
+	if cfg.WorkingSetPath == "" && cfg.BaseDir != "" {
+		cfg.WorkingSetPath = filepath.Join(cfg.BaseDir, "working_set_pages")
+	}
+	return cfg
+}
+
+func (s *SnapshotState) refreshSnapshotLoad(cfg SnapshotStateCfg) {
+	cfg = normalizeSnapshotStateCfg(cfg)
+
+	trace := s.trace
+	if trace == nil {
+		trace = initTrace(filepath.Join(cfg.BaseDir, "trace"))
+	} else {
+		trace.traceFileName = filepath.Join(cfg.BaseDir, "trace")
+	}
+	isRecordReady := s.isRecordReady
+	isEverActivated := s.isEverActivated
+	totalPFServed := s.totalPFServed
+	uniquePFServed := s.uniquePFServed
+	reusedPFServed := s.reusedPFServed
+	latencyMetrics := s.latencyMetrics
+
+	s.SnapshotStateCfg = cfg
+	s.firstPageFaultOnce = nil
+	s.userFaultFD = nil
+	s.guestRegionMappings = nil
+	s.trace = trace
+	s.epfd = 0
+	s.wakeFD = -1
+	s.quitCh = nil
+	s.pollDoneCh = nil
+	s.isEverActivated = isEverActivated
+	s.isActive = false
+	s.isRecordReady = isRecordReady
+	s.guestMem = nil
+	s.workingSet = nil
+	s.totalPFServed = totalPFServed
+	s.uniquePFServed = uniquePFServed
+	s.reusedPFServed = reusedPFServed
+	s.latencyMetrics = latencyMetrics
+	s.replayedNum = 0
+	s.uniqueNum = 0
+	s.currentMetric = nil
+
+	if s.metricsModeOn {
+		if s.totalPFServed == nil {
+			s.totalPFServed = make([]float64, 0)
+		}
+		if s.uniquePFServed == nil {
+			s.uniquePFServed = make([]float64, 0)
+		}
+		if s.reusedPFServed == nil {
+			s.reusedPFServed = make([]float64, 0)
+		}
+		if s.latencyMetrics == nil {
+			s.latencyMetrics = make([]*metrics.Metric, 0)
+		}
+	}
+}
+
 func (s *SnapshotState) setupStateOnActivate() {
 	s.isActive = true
 	s.isEverActivated = true
 	s.firstPageFaultOnce = new(sync.Once)
-	s.quitCh = make(chan int)
+	s.wakeFD = -1
+	s.quitCh = make(chan int, 1)
+	s.pollDoneCh = make(chan struct{})
 
 	if s.metricsModeOn {
 		s.uniqueNum = 0
 		s.replayedNum = 0
-		s.currentMetric = metrics.NewMetric()
-	}
-}
-
-func (s *SnapshotState) getUFFD() error {
-	var d net.Dialer
-	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
-	defer cancel()
-
-	for {
-		c, err := d.DialContext(ctx, "unix", s.InstanceSockAddr)
-		if err != nil {
-			if ctx.Err() != nil {
-				log.Error("Failed to dial within the context timeout")
-				return err
-			}
-			time.Sleep(1 * time.Millisecond)
-			continue
+		if s.currentMetric == nil {
+			s.currentMetric = metrics.NewMetric()
 		}
-
-		defer func() { _ = c.Close() }()
-
-		sendfdConn := c.(*net.UnixConn)
-
-		fs, err := fd.Get(sendfdConn, 1, []string{"a file"})
-		if err != nil {
-			log.Error("Failed to receive the uffd")
-			return err
-		}
-
-		s.userFaultFD = fs[0]
-
-		return nil
 	}
 }
 
 func (s *SnapshotState) processMetrics() {
-	if s.metricsModeOn && s.isRecordReady {
-		s.uniquePFServed = append(s.uniquePFServed, float64(s.uniqueNum))
+	if !s.metricsModeOn || s.currentMetric == nil {
+		return
+	}
 
+	if s.isRecordReady {
 		if s.IsLazyMode {
 			s.totalPFServed = append(s.totalPFServed, float64(s.replayedNum))
-			s.reusedPFServed = append(
-				s.reusedPFServed,
-				float64(s.replayedNum-s.uniqueNum),
-			)
+			s.reusedPFServed = append(s.reusedPFServed, float64(s.replayedNum-s.uniqueNum))
 		}
 
+		s.uniquePFServed = append(s.uniquePFServed, float64(s.uniqueNum))
 		s.latencyMetrics = append(s.latencyMetrics, s.currentMetric)
 	}
+	s.currentMetric = nil
 }
 
 func (s *SnapshotState) getTraceFile() string {
@@ -183,6 +206,7 @@ func (s *SnapshotState) mapGuestMemory() error {
 		log.Errorf("Failed to open guest memory file: %v", err)
 		return err
 	}
+	defer func() { _ = fd.Close() }()
 
 	s.guestMem, err = unix.Mmap(int(fd.Fd()), 0, s.GuestMemSize, unix.PROT_READ, unix.MAP_PRIVATE)
 	if err != nil {
@@ -202,326 +226,52 @@ func (s *SnapshotState) unmapGuestMemory() error {
 	return nil
 }
 
-// alignment returns alignment of the block in memory
-// with reference to alignSize
-//
-// Can't check alignment of a zero sized block as &block[0] is invalid
-func alignment(block []byte, alignSize int) int {
-	return int(uintptr(unsafe.Pointer(&block[0])) & uintptr(alignSize-1))
-}
-
-// AlignedBlock returns []byte of size BlockSize aligned to a multiple
-// of alignSize in memory (must be power of two)
-func AlignedBlock(blockSize int) []byte {
-	alignSize := os.Getpagesize() // must be multiple of the filesystem block size
-
-	if blockSize == 0 {
-		return nil
-	}
-
-	block := make([]byte, blockSize+alignSize)
-
-	a := alignment(block, alignSize)
-	offset := 0
-	if a != 0 {
-		offset = alignSize - a
-	}
-	block = block[offset : offset+blockSize]
-
-	// Check
-	if blockSize != 0 {
-		a = alignment(block, alignSize)
-		if a != 0 {
-			log.Fatal("Failed to align block")
-		}
-	}
-	return block
-}
-
-// fetchState Fetches the working set file (or the whole guest memory) and the VMM state file
+// fetchState verifies snapshot state and loads the replay working set when ready.
 func (s *SnapshotState) fetchState() error {
 	if _, err := os.ReadFile(s.VMMStatePath); err != nil {
 		log.Errorf("Failed to fetch VMM state: %v\n", err)
 		return err
 	}
 
-	size := len(s.trace.trace) * os.Getpagesize()
-
-	// O_DIRECT allows to fully leverage disk bandwidth by bypassing the OS page cache
-	f, err := os.OpenFile(s.WorkingSetPath, os.O_RDONLY|syscall.O_DIRECT, 0600)
-	if err != nil {
-		log.Errorf("Failed to open the working set file for direct-io: %v\n", err)
-		return err
-	}
-
-	s.workingSet = AlignedBlock(size) // direct io requires aligned buffer
-
-	if n, err := f.Read(s.workingSet); n != size || err != nil {
-		log.Errorf("Reading working set file failed: %v\n", err)
-		return err
-	}
-
-	log.Debug("Fetched the entire working set")
-	if err := f.Close(); err != nil {
-		log.Errorf("Failed to close the working set file: %v\n", err)
-		return err
+	if s.isRecordReady && !s.IsLazyMode {
+		return s.fetchWorkingSet()
 	}
 
 	return nil
 }
 
-func (s *SnapshotState) pollUserPageFaults(readyCh chan int) {
-	logger := log.WithFields(log.Fields{"vmID": s.VMID})
-
-	var events [1]syscall.EpollEvent
-
-	if err := s.registerEpoller(); err != nil {
-		logger.Fatalf("register_epoller: %v", err)
+func (s *SnapshotState) fetchWorkingSet() error {
+	pageSize := s.trace.pageSize
+	if pageSize == 0 {
+		pageSize = uint64(os.Getpagesize())
 	}
 
-	logger.Debug("Starting polling loop")
-
-	defer func() { _ = syscall.Close(s.epfd) }()
-
-	readyCh <- 0
-
-	for {
-		select {
-		case <-s.quitCh:
-			logger.Debug("Handler received a signal to quit")
-			return
-		default:
-			nevents, err := syscall.EpollWait(s.epfd, events[:], -1)
-			if err != nil {
-				logger.Fatalf("epoll_wait: %v", err)
-				break
-			}
-
-			if nevents < 1 {
-				panic("Wrong number of events")
-			}
-
-			for i := 0; i < nevents; i++ {
-				event := events[i]
-
-				fd := int(event.Fd)
-
-				stateFd := int(s.userFaultFD.Fd())
-
-				if fd != stateFd && stateFd != -1 {
-					logger.Fatalf("Received event from unknown fd")
-				}
-
-				goMsg := make([]byte, sizeOfUFFDMsg())
-
-				if nread, err := syscall.Read(fd, goMsg); err != nil || nread != len(goMsg) {
-					if !errors.Is(err, syscall.EBADF) {
-						log.Fatalf("Read uffd_msg failed: %v", err)
-					}
-					break
-				}
-
-				if event := uint8(goMsg[0]); event != uffdPageFault() {
-					log.Fatal("Received wrong event type")
-				}
-
-				address := binary.LittleEndian.Uint64(goMsg[16:])
-
-				if err := s.servePageFault(fd, address); err != nil {
-					log.Fatalf("Failed to serve page fault")
-				}
-			}
-		}
+	size := uint64(len(s.trace.trace)) * pageSize
+	if size > uint64(int(^uint(0)>>1)) {
+		return fmt.Errorf("working set too large: %#x", size)
 	}
-}
-
-func (s *SnapshotState) registerEpoller() error {
-	logger := log.WithFields(log.Fields{"vmID": s.VMID})
-
-	var (
-		err   error
-		event syscall.EpollEvent
-		fdInt int
-	)
-
-	fdInt = int(s.userFaultFD.Fd())
-
-	event.Events = syscall.EPOLLIN
-	event.Fd = int32(fdInt)
-
-	s.epfd, err = syscall.EpollCreate1(0)
-	if err != nil {
-		logger.Errorf("Failed to create epoller %v", err)
-		return err
-	}
-
-	if err := syscall.EpollCtl(
-		s.epfd,
-		syscall.EPOLL_CTL_ADD,
-		fdInt,
-		&event,
-	); err != nil {
-		logger.Errorf("Failed to subscribe VM %v", err)
-		return err
-	}
-
-	return nil
-}
-
-func (s *SnapshotState) servePageFault(fd int, address uint64) error {
-	var (
-		tStart              time.Time
-		workingSetInstalled bool
-	)
-
-	s.firstPageFaultOnce.Do(
-		func() {
-			s.startAddress = address
-
-			if s.isRecordReady && !s.IsLazyMode {
-				if s.metricsModeOn {
-					tStart = time.Now()
-				}
-				s.installWorkingSetPages(fd)
-				if s.metricsModeOn {
-					s.currentMetric.MetricMap[installWSMetric] = metrics.ToUS(time.Since(tStart))
-				}
-
-				workingSetInstalled = true
-			}
-		})
-
-	if workingSetInstalled {
+	if size == 0 {
+		s.workingSet = nil
 		return nil
 	}
 
-	offset := address - s.startAddress
-
-	src := uint64(uintptr(unsafe.Pointer(&s.guestMem[offset])))
-	dst := uint64(int64(address) & ^(int64(os.Getpagesize()) - 1))
-	mode := uint64(0)
-
-	rec := Record{
-		offset: offset,
-	}
-
-	if !s.isRecordReady {
-		s.trace.AppendRecord(rec)
-	} else {
-		log.Debug("Serving a page that is missing from the working set")
-	}
-
-	if s.metricsModeOn {
-		if s.isRecordReady {
-			if s.IsLazyMode {
-				if !s.trace.containsRecord(rec) {
-					s.uniqueNum++
-				}
-				s.replayedNum++
-			} else {
-				s.uniqueNum++
-			}
-
-		}
-
-		tStart = time.Now()
-	}
-
-	err := installRegion(fd, src, dst, mode, 1)
-
-	if s.metricsModeOn {
-		s.currentMetric.MetricMap[serveUniqueMetric] += metrics.ToUS(time.Since(tStart))
-	}
-
-	return err
-}
-
-func (s *SnapshotState) installWorkingSetPages(fd int) {
-	log.Debug("Installing the working set pages")
-
-	// build a list of sorted regions
-	keys := make([]uint64, 0)
-	for k := range s.trace.regions {
-		keys = append(keys, k)
-	}
-	sort.Slice(keys, func(i, j int) bool { return keys[i] < keys[j] })
-
-	var (
-		srcOffset uint64
-	)
-
-	for _, offset := range keys {
-		regLength := s.trace.regions[offset]
-		regAddress := s.startAddress + offset
-		mode := uint64(C.const_UFFDIO_COPY_MODE_DONTWAKE)
-		src := uint64(uintptr(unsafe.Pointer(&s.workingSet[srcOffset])))
-		dst := regAddress
-
-		if err := installRegion(fd, src, dst, mode, uint64(regLength)); err != nil {
-			log.Fatalf("install_region: %v", err)
-		}
-
-		srcOffset += uint64(regLength) * 4096
-	}
-
-	wake(fd, s.startAddress, os.Getpagesize())
-}
-
-func installRegion(fd int, src, dst, mode, len uint64) error {
-	cUC := C.struct_uffdio_copy{
-		mode: C.ulonglong(mode),
-		copy: 0,
-		src:  C.ulonglong(src),
-		dst:  C.ulonglong(dst),
-		len:  C.ulonglong(uint64(os.Getpagesize()) * len),
-	}
-
-	err := ioctl(uintptr(fd), int(C.const_UFFDIO_COPY), unsafe.Pointer(&cUC))
+	f, err := os.Open(s.WorkingSetPath)
 	if err != nil {
+		log.Errorf("Failed to open the working set file: %v\n", err)
 		return err
 	}
+	defer func() { _ = f.Close() }()
 
-	return nil
-}
-
-func ioctl(fd uintptr, request int, argp unsafe.Pointer) error {
-	_, _, errno := unix.Syscall(
-		unix.SYS_IOCTL,
-		fd,
-		uintptr(request),
-		// Note that the conversion from unsafe.Pointer to uintptr _must_
-		// occur in the call expression.  See the package unsafe documentation
-		// for more details.
-		uintptr(argp),
-	)
-	if errno != 0 {
-		return os.NewSyscallError("ioctl", fmt.Errorf("%d", int(errno)))
-	}
-
-	return nil
-}
-
-func wake(fd int, startAddress uint64, len int) {
-	cUR := C.struct_uffdio_range{
-		start: C.ulonglong(startAddress),
-		len:   C.ulonglong(len),
-	}
-
-	err := ioctl(uintptr(fd), int(C.const_UFFDIO_WAKE), unsafe.Pointer(&cUR))
+	s.workingSet = make([]byte, int(size))
+	n, err := io.ReadFull(f, s.workingSet)
 	if err != nil {
-		log.Fatalf("ioctl failed: %v", err)
+		log.Errorf("Reading working set file failed: %v\n", err)
+		return err
 	}
-}
+	if n != len(s.workingSet) {
+		return io.ErrUnexpectedEOF
+	}
 
-//nolint:unused
-func registerForUpf(startAddress []byte, len uint64) int {
-	return int(C.register_for_upf(unsafe.Pointer(&startAddress[0]), C.ulong(len)))
-}
-
-func sizeOfUFFDMsg() int {
-	return C.sizeof_struct_uffd_msg
-}
-
-func uffdPageFault() uint8 {
-	return uint8(C.const_UFFD_EVENT_PAGEFAULT)
+	log.Debug("Fetched the entire working set")
+	return nil
 }

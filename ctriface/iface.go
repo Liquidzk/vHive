@@ -255,8 +255,6 @@ func (o *Orchestrator) StartVMWithEnvironment(ctx context.Context, vmID, imageNa
 			IsLazyMode:     o.isLazyMode,
 			VMMStatePath:   o.getSnapshotFile(vmID),
 			WorkingSetPath: o.getWorkingSetFile(vmID),
-			// FIXME (gh-807)
-			//InstanceSockAddr: resp.UPFSockPath,
 		}
 		if err := o.memoryManager.RegisterVM(stateCfg); err != nil {
 			return nil, nil, errors.Wrap(err, "failed to register VM with memory manager")
@@ -316,6 +314,12 @@ func (o *Orchestrator) StopSingleVM(ctx context.Context, vmID string) error {
 		logger.WithError(err).Error("failed to stop firecracker-containerd VM")
 	}
 
+	if o.GetUPFEnabled() {
+		if err := o.memoryManager.Deactivate(vmID); err != nil {
+			logger.WithError(err).Warn("failed to deactivate VM in memory manager")
+		}
+	}
+
 	if err := o.vmPool.Free(vmID); err != nil {
 		logger.Error("failed to free VM from VM pool")
 		return err
@@ -359,7 +363,7 @@ func getK8sDNS() []string {
 }
 
 func (o *Orchestrator) getVMConfig(vm *misc.VM) *proto.CreateVMRequest {
-	kernelArgs := "ro noapic reboot=k panic=1 pci=off nomodules systemd.log_color=false systemd.unit=firecracker.target init=/sbin/overlay-init tsc=reliable quiet 8250.nr_uarts=0 ipv6.disable=1"
+	kernelArgs := "ro noapic reboot=k panic=1 acpi=off pci=off nomodules systemd.log_color=false systemd.journald.forward_to_console systemd.unit=firecracker.target init=/sbin/overlay-init tsc=reliable quiet ipv6.disable=1 console=ttyS0"
 
 	return &proto.CreateVMRequest{
 		VMID:           vm.ID,
@@ -367,7 +371,7 @@ func (o *Orchestrator) getVMConfig(vm *misc.VM) *proto.CreateVMRequest {
 		KernelArgs:     kernelArgs,
 		MachineCfg: &proto.FirecrackerMachineConfiguration{
 			VcpuCount:  1,
-			MemSizeMib: 256,
+			MemSizeMib: 512,
 		},
 		NetworkInterfaces: []*proto.FirecrackerNetworkInterface{{
 			AllowMMDS: true,
@@ -493,13 +497,37 @@ func (o *Orchestrator) CreateSnapshot(ctx context.Context, vmID string, snap *sn
 	return nil
 }
 
+func logSnapshotLoadFailure(logger *log.Entry, snap *snapshotting.Snapshot, conf *proto.CreateVMRequest, err error) {
+	logger.WithError(err).WithFields(log.Fields{
+		"snapFilePath":          snap.GetSnapshotFilePath(),
+		"memFilePath":           snap.GetMemFilePath(),
+		"containerSnapshotPath": conf.ContainerSnapshotPath,
+		"memoryBackendType":     conf.GetMemBackend().GetBackendType(),
+		"memoryBackendPath":     conf.GetMemBackend().GetBackendPath(),
+	}).Error("failed to load snapshot of the VM")
+}
+
+func configureSnapshotMemoryBackend(conf *proto.CreateVMRequest, backendType, backendPath string) {
+	conf.MemFilePath = ""
+	conf.MemBackend = &proto.MemoryBackend{
+		BackendType: backendType,
+		BackendPath: backendPath,
+	}
+}
+
 // LoadSnapshot Loads a snapshot of a VM
 func (o *Orchestrator) LoadSnapshot(ctx context.Context, vmID string, snap *snapshotting.Snapshot) (_ *StartVMResponse, _ *metrics.Metric, retErr error) {
+	if err := o.validateUPFMode(); err != nil {
+		return nil, nil, err
+	}
+
 	var (
-		loadSnapshotMetric   = metrics.NewMetric()
-		tStart               time.Time
-		loadErr, activateErr error
-		loadDone             = make(chan int)
+		loadSnapshotMetric = metrics.NewMetric()
+		tStart             time.Time
+		loadErr            error
+		activateErr        error
+		deactivateErr      error
+		activateErrChan    chan error
 	)
 
 	logger := log.WithFields(log.Fields{"vmID": vmID})
@@ -524,7 +552,8 @@ func (o *Orchestrator) LoadSnapshot(ctx context.Context, vmID string, snap *snap
 	conf := o.getVMConfig(vm)
 	conf.LoadSnapshot = true
 	conf.SnapshotPath = snap.GetSnapshotFilePath()
-	conf.MemFilePath = snap.GetMemFilePath()
+	configureSnapshotMemoryBackend(conf, "File", snap.GetMemFilePath())
+	uffdSock := filepath.Join(o.getVMBaseDir(vmID), "uffd.sock")
 
 	if o.snapshotter == "devmapper" {
 		if vm.Image, err = o.getImage(ctx, snap.GetImage()); err != nil {
@@ -583,6 +612,21 @@ func (o *Orchestrator) LoadSnapshot(ctx context.Context, vmID string, snap *snap
 	}
 
 	if o.GetUPFEnabled() {
+		configureSnapshotMemoryBackend(conf, "Uffd", uffdSock)
+
+		if err := o.memoryManager.PrepareSnapshotLoad(manager.SnapshotStateCfg{
+			VMID:             vmID,
+			VMMStatePath:     snap.GetSnapshotFilePath(),
+			GuestMemPath:     snap.GetMemFilePath(),
+			InstanceSockAddr: uffdSock,
+			BaseDir:          o.getVMBaseDir(vmID),
+			GuestMemSize:     int(conf.MachineCfg.MemSizeMib) * 1024 * 1024,
+			IsLazyMode:       o.isLazyMode,
+			WorkingSetPath:   o.getWorkingSetFile(vmID),
+		}); err != nil {
+			return nil, nil, err
+		}
+
 		if err := o.memoryManager.FetchState(vmID); err != nil {
 			return nil, nil, err
 		}
@@ -590,49 +634,43 @@ func (o *Orchestrator) LoadSnapshot(ctx context.Context, vmID string, snap *snap
 
 	tStart = time.Now()
 
-	go func() {
-		defer close(loadDone)
-
-		if _, loadErr = o.fcClient.CreateVM(ctx, conf); loadErr != nil {
-			logger.Error("Failed to load snapshot of the VM: ", loadErr)
-			logger.Errorf("snapFilePath: %s, memFilePath: %s, containerSnapshotPath: %s", snap.GetSnapshotFilePath(), snap.GetMemFilePath(), conf.ContainerSnapshotPath)
-			files, err := os.ReadDir(filepath.Dir(snap.GetSnapshotFilePath()))
-			if err != nil {
-				logger.Error(err)
-			}
-
-			snapFiles := ""
-			for _, f := range files {
-				snapFiles += f.Name() + ", "
-			}
-
-			logger.Error(snapFiles)
-
-			files, _ = os.ReadDir(filepath.Dir(conf.ContainerSnapshotPath))
-			if err != nil {
-				logger.Error(err)
-			}
-
-			snapFiles = ""
-			for _, f := range files {
-				snapFiles += f.Name() + ", "
-			}
-			logger.Error(snapFiles)
-		}
-	}()
-
 	if o.GetUPFEnabled() {
-		if activateErr = o.memoryManager.Activate(vmID); activateErr != nil {
-			logger.Warn("Failed to activate VM in the memory manager", activateErr)
+		activateErrChan = make(chan error, 1)
+		socketReadyChan := make(chan struct{}, 1)
+		go func() {
+			err := o.memoryManager.Activate(vmID, socketReadyChan)
+			if err != nil {
+				logger.WithError(err).Warn("Failed to activate VM in the memory manager")
+			}
+			activateErrChan <- err
+		}()
+
+		select {
+		case <-socketReadyChan:
+		case activateErr = <-activateErrChan:
+			return nil, nil, activateErr
 		}
 	}
 
-	<-loadDone
+	if _, loadErr = o.fcClient.CreateVM(ctx, conf); loadErr != nil {
+		logSnapshotLoadFailure(logger, snap, conf, loadErr)
+	}
+
+	if activateErrChan != nil {
+		activateErr = <-activateErrChan
+	}
+
+	if loadErr != nil && activateErr == nil && activateErrChan != nil {
+		deactivateErr = o.memoryManager.Deactivate(vmID)
+		if deactivateErr != nil {
+			logger.WithError(deactivateErr).Warn("Failed to deactivate VM in the memory manager after snapshot load failure")
+		}
+	}
 
 	loadSnapshotMetric.MetricMap[metrics.LoadVMM] = metrics.ToUS(time.Since(tStart))
 
-	if loadErr != nil || activateErr != nil {
-		multierr := multierror.Of(loadErr, activateErr)
+	if loadErr != nil || activateErr != nil || deactivateErr != nil {
+		multierr := multierror.Of(loadErr, activateErr, deactivateErr)
 		return nil, nil, multierr
 	}
 

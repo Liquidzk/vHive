@@ -51,11 +51,6 @@ var (
 func TestMain(m *testing.M) {
 	flag.Parse()
 
-	if *isUPFEnabled {
-		log.Error("User-level page faults are temporarily disabled (gh-807)")
-		os.Exit(-1)
-	}
-
 	os.Exit(m.Run())
 }
 
@@ -78,6 +73,8 @@ func TestStartSnapStopLoad(t *testing.T) {
 		*snapshotter,
 		"",
 		WithTestModeOn(true),
+		WithUPF(*isUPFEnabled),
+		WithLazyMode(*isLazyMode),
 		WithDockerCredentials(*dockerCredentials),
 	)
 

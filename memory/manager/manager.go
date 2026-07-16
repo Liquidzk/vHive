@@ -90,6 +90,36 @@ func (m *MemoryManager) RegisterVM(cfg SnapshotStateCfg) error {
 	return nil
 }
 
+// PrepareSnapshotLoad creates or refreshes the state used to serve UFFD faults
+// while loading a VM snapshot.
+func (m *MemoryManager) PrepareSnapshotLoad(cfg SnapshotStateCfg) error {
+	m.Lock()
+	defer m.Unlock()
+
+	vmID := cfg.VMID
+	if vmID == "" {
+		return errors.New("VMID is required")
+	}
+
+	cfg.metricsModeOn = m.MetricsModeOn
+
+	state, ok := m.instances[vmID]
+	if !ok {
+		m.instances[vmID] = NewSnapshotState(cfg)
+		return nil
+	}
+	if state.isActive {
+		return errors.New("failed to prepare snapshot load, VM still active")
+	}
+	if state.userFaultFD != nil {
+		_ = state.userFaultFD.Close()
+		state.userFaultFD = nil
+	}
+
+	state.refreshSnapshotLoad(cfg)
+	return nil
+}
+
 // DeregisterVM Deregisters a VM from the memory manager
 func (m *MemoryManager) DeregisterVM(vmID string) error {
 	m.Lock()
@@ -115,8 +145,9 @@ func (m *MemoryManager) DeregisterVM(vmID string) error {
 	return nil
 }
 
-// Activate Creates an epoller to serve page faults for the VM
-func (m *MemoryManager) Activate(vmID string) error {
+// Activate creates an epoller to serve page faults and reports when the UFFD
+// socket listener is ready for Firecracker to connect.
+func (m *MemoryManager) Activate(vmID string, socketReadyCh chan<- struct{}) error {
 	logger := log.WithFields(log.Fields{"vmID": vmID})
 
 	logger.Debug("Activating instance in the memory manager")
@@ -124,7 +155,7 @@ func (m *MemoryManager) Activate(vmID string) error {
 	var (
 		ok      bool
 		state   *SnapshotState
-		readyCh = make(chan int)
+		readyCh = make(chan error)
 	)
 
 	m.Lock()
@@ -148,8 +179,11 @@ func (m *MemoryManager) Activate(vmID string) error {
 		return err
 	}
 
-	if err := state.getUFFD(); err != nil {
+	if err := state.getUFFD(socketReadyCh); err != nil {
 		logger.Error("Failed to get uffd")
+		if unmapErr := state.unmapGuestMemory(); unmapErr != nil {
+			logger.WithError(unmapErr).Error("Failed to munmap guest memory after getUFFD failure")
+		}
 		return err
 	}
 
@@ -157,22 +191,30 @@ func (m *MemoryManager) Activate(vmID string) error {
 
 	go state.pollUserPageFaults(readyCh)
 
-	<-readyCh
+	if err := <-readyCh; err != nil {
+		logger.WithError(err).Error("Failed to start UFFD page fault polling")
+		if state.userFaultFD != nil {
+			_ = state.userFaultFD.Close()
+		}
+		if unmapErr := state.unmapGuestMemory(); unmapErr != nil {
+			logger.WithError(unmapErr).Error("Failed to munmap guest memory after UFFD poller failure")
+		}
+		return err
+	}
 
 	return nil
 }
 
-// FetchState Fetches the working set file (or the whole guest memory) and the VMM state file
+// FetchState verifies that snapshot state needed by the memory manager exists.
 func (m *MemoryManager) FetchState(vmID string) error {
 	logger := log.WithFields(log.Fields{"vmID": vmID})
 
-	logger.Debug("Activating instance in the memory manager")
+	logger.Debug("Fetching state in the memory manager")
 
 	var (
 		ok     bool
 		state  *SnapshotState
 		tStart time.Time
-		err    error
 	)
 
 	m.Lock()
@@ -186,16 +228,17 @@ func (m *MemoryManager) FetchState(vmID string) error {
 
 	m.Unlock()
 
-	if state.isRecordReady && !state.IsLazyMode {
-		if state.metricsModeOn {
-			tStart = time.Now()
-		}
-		err = state.fetchState()
-		if state.metricsModeOn {
-			state.currentMetric.MetricMap[fetchStateMetric] = metrics.ToUS(time.Since(tStart))
-		}
+	if state.metricsModeOn && state.currentMetric == nil {
+		state.currentMetric = metrics.NewMetric()
+	}
+	if state.metricsModeOn && state.isRecordReady && !state.IsLazyMode {
+		tStart = time.Now()
 	}
 
+	err := state.fetchState()
+	if err == nil && !tStart.IsZero() {
+		state.currentMetric.MetricMap[fetchStateMetric] = metrics.ToUS(time.Since(tStart))
+	}
 	return err
 }
 
@@ -230,7 +273,10 @@ func (m *MemoryManager) Deactivate(vmID string) error {
 		return errors.New("VM not activated")
 	}
 
-	state.quitCh <- 0
+	state.stopPolling()
+	state.waitForPoller()
+	state.closeWakeFD()
+
 	if err := state.unmapGuestMemory(); err != nil {
 		logger.Error("Failed to munmap guest memory")
 		return err
@@ -238,9 +284,18 @@ func (m *MemoryManager) Deactivate(vmID string) error {
 
 	state.processMetrics()
 
-	defer func() { _ = state.userFaultFD.Close() }()
+	if state.userFaultFD != nil {
+		defer func() { _ = state.userFaultFD.Close() }()
+	}
+
 	if !state.isRecordReady && !state.IsLazyMode {
-		state.trace.ProcessRecord(state.GuestMemPath, state.WorkingSetPath)
+		pageSize, err := guestMappingPageSize(state.guestRegionMappings)
+		if err != nil {
+			return err
+		}
+		if err := state.trace.ProcessRecord(state.GuestMemPath, state.WorkingSetPath, pageSize); err != nil {
+			return err
+		}
 	}
 
 	state.isRecordReady = true
@@ -369,12 +424,12 @@ func getLazyHeaderStats(state *SnapshotState, functionName string) ([]string, []
 
 	stats := []string{
 		functionName,
-		strconv.Itoa(len(state.trace.trace)), // number of records (i.e., offsets)
-		strconv.Itoa(int(totalMean)),         // number of pages served
+		strconv.Itoa(len(state.trace.trace)),
+		strconv.Itoa(int(totalMean)),
 		fmt.Sprintf("%.1f", totalStd),
-		strconv.Itoa(int(reusedMean)), // number of pages found in the trace
+		strconv.Itoa(int(reusedMean)),
 		fmt.Sprintf("%.1f", reusedStd),
-		strconv.Itoa(int(uniqueMean)), // number of pages not found in the trace
+		strconv.Itoa(int(uniqueMean)),
 		fmt.Sprintf("%.1f", uniqueStd),
 	}
 
@@ -394,9 +449,9 @@ func getRecRepHeaderStats(state *SnapshotState, functionName string) ([]string, 
 
 	stats := []string{
 		functionName,
-		strconv.Itoa(len(state.trace.trace)),   // number of records (i.e., offsets)
-		strconv.Itoa(len(state.trace.regions)), // number of contiguous regions in the trace
-		strconv.Itoa(int(uniqueMean)),          // number of pages not found in the trace
+		strconv.Itoa(len(state.trace.trace)),
+		strconv.Itoa(len(state.trace.regions)),
+		strconv.Itoa(int(uniqueMean)),
 		fmt.Sprintf("%.1f", uniqueStd),
 	}
 

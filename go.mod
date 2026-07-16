@@ -3,7 +3,7 @@ module github.com/vhive-serverless/vhive
 go 1.26.2
 
 replace (
-	github.com/firecracker-microvm/firecracker-containerd => github.com/vhive-serverless/firecracker-containerd v0.0.0-20251220120737-a3dabeb332c7
+	github.com/firecracker-microvm/firecracker-containerd => github.com/vhive-serverless/firecracker-containerd v0.0.0-20260713114451-bb007a1ef569
 	github.com/vhive-serverless/vhive/examples/protobuf/helloworld => ./examples/protobuf/helloworld
 )
 
@@ -13,7 +13,6 @@ require (
 	github.com/containerd/stargz-snapshotter v0.11.3
 	github.com/davecgh/go-spew v1.1.2-0.20180830191138-d8f796af33cc
 	github.com/firecracker-microvm/firecracker-containerd v0.0.0-00010101000000-000000000000
-	github.com/ftrvxmtrx/fd v0.0.0-20150925145434-c6d800382fff
 	github.com/go-multierror/multierror v1.0.2
 	github.com/golang/protobuf v1.5.4
 	github.com/google/nftables v0.3.0
@@ -32,6 +31,7 @@ require (
 	gonum.org/v1/gonum v0.17.0
 	gonum.org/v1/plot v0.17.0
 	google.golang.org/grpc v1.82.0
+	google.golang.org/protobuf v1.36.11
 	k8s.io/cri-api v0.27.1
 )
 
@@ -91,6 +91,5 @@ require (
 	golang.org/x/text v0.37.0 // indirect
 	google.golang.org/genproto v0.0.0-20240227224415-6ceb2ff114de // indirect
 	google.golang.org/genproto/googleapis/rpc v0.0.0-20260414002931-afd174a4e478 // indirect
-	google.golang.org/protobuf v1.36.11 // indirect
 	gopkg.in/yaml.v3 v3.0.1 // indirect
 )
