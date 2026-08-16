@@ -135,6 +135,13 @@ func WithShimPoolSize(shimPoolSize int) OrchestratorOption {
 	}
 }
 
+// WithVMMemSizeMib sets the memory size used by newly created microVMs.
+func WithVMMemSizeMib(vmMemSizeMib uint32) OrchestratorOption {
+	return func(o *Orchestrator) {
+		o.vmMemSizeMib = vmMemSizeMib
+	}
+}
+
 func WithVethPrefix(vethPrefix string) OrchestratorOption {
 	return func(o *Orchestrator) {
 		o.vethPrefix = vethPrefix

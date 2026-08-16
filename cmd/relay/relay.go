@@ -43,6 +43,42 @@ var (
 	dropCaches *bool
 )
 
+const (
+	functionReadyTimeout = 60 * time.Second
+	relayReadyTimeout    = 10 * time.Second
+	readyRetryInterval   = 100 * time.Millisecond
+)
+
+func waitForTCP(ctx context.Context, address string, timeout time.Duration) error {
+	readyCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
+	dialer := &net.Dialer{Timeout: time.Second}
+	var lastErr error
+	for {
+		conn, err := dialer.DialContext(readyCtx, "tcp", address)
+		if err == nil {
+			_ = conn.Close()
+			return nil
+		}
+		lastErr = err
+
+		select {
+		case <-readyCtx.Done():
+			return fmt.Errorf("timed out waiting for %s: %w (last dial error: %v)", address, readyCtx.Err(), lastErr)
+		case <-time.After(readyRetryInterval):
+		}
+	}
+}
+
+func grpcStatus(header http.Header) string {
+	status := header.Get("Grpc-Status")
+	if status == "" {
+		status = header.Get(http.TrailerPrefix + "Grpc-Status")
+	}
+	return status
+}
+
 func dropLinuxPageCaches() {
 	if err := exec.Command("sync").Run(); err != nil {
 		log.Warnf("failed to sync before dropping page caches: %v", err)
@@ -141,11 +177,9 @@ func handler(w http.ResponseWriter, r *http.Request) {
 	} else if *baseSnap { // start from base snapshot case
 		log.Debugf("No snapshot for rev %s, starting from base snapshot", rev)
 		resp, err = orch.StartWithBaseSnapshot(ctx, image, envArr, argsArr)
-		time.Sleep(2 * time.Second)
 	} else { // boot case
 		log.Debugf("No snapshot for rev %s, starting from image", rev)
 		resp, _, err = orch.StartVMWithEnvironment(ctx, image, envArr, argsArr)
-		time.Sleep(2 * time.Second)
 	}
 	if err != nil {
 		http.Error(w, fmt.Sprintf("Server Error: %v", err), http.StatusInternalServerError)
@@ -157,9 +191,19 @@ func handler(w http.ResponseWriter, r *http.Request) {
 	vmId := resp.VMID
 
 	log.Debugf("created VM with ID %s and IP %s for revision %s", resp.VMID, resp.GuestIP, r.Header.Get("revision"))
+	functionEndpoint := resp.GuestIP + ":50051"
+	if err := waitForTCP(ctx, functionEndpoint, functionReadyTimeout); err != nil {
+		log.Errorf("function readiness check failed for VM %s: %v", vmId, err)
+		if stopErr := orch.StopSingleVM(ctx, vmId); stopErr != nil {
+			log.Errorf("failed to stop unready VM %s: %v", vmId, stopErr)
+		}
+		http.Error(w, fmt.Sprintf("Function Readiness Error: %v", err), http.StatusServiceUnavailable)
+		return
+	}
+	log.Debugf("function endpoint %s is ready", functionEndpoint)
 
 	relayArgs := r.Header.Get("relayArgs")
-	endpoint := resp.GuestIP + ":50051"
+	endpoint := functionEndpoint
 	if relayArgs != "" {
 		mu.Lock()
 		relayPort++
@@ -187,7 +231,15 @@ func handler(w http.ResponseWriter, r *http.Request) {
 			}
 		}()
 
-		time.Sleep(50 * time.Millisecond)
+		if err := waitForTCP(ctx, endpoint, relayReadyTimeout); err != nil {
+			log.Errorf("vswarm relay readiness check failed for VM %s: %v", vmId, err)
+			if stopErr := orch.StopSingleVM(ctx, vmId); stopErr != nil {
+				log.Errorf("failed to stop VM %s after relay readiness failure: %v", vmId, stopErr)
+			}
+			http.Error(w, fmt.Sprintf("Relay Readiness Error: %v", err), http.StatusServiceUnavailable)
+			return
+		}
+		log.Debugf("vswarm relay endpoint %s is ready", endpoint)
 	}
 
 	log.Debugf("Sending invocation to %s", vmId)
@@ -201,12 +253,15 @@ func handler(w http.ResponseWriter, r *http.Request) {
 	}
 	recorder := &statusRecorder{ResponseWriter: w, status: http.StatusOK}
 	proxy.ServeHTTP(recorder, r)
+	invocationGRPCStatus := grpcStatus(recorder.Header())
+	invocationOK := recorder.status >= http.StatusOK && recorder.status < http.StatusMultipleChoices &&
+		(invocationGRPCStatus == "" || invocationGRPCStatus == "0")
 
-	log.Debugf("Invocation to %s completed in %v with status %d", vmId, time.Since(startTime), recorder.status)
+	log.Debugf("Invocation to %s completed in %v with HTTP status %d and gRPC status %q", vmId, time.Since(startTime), recorder.status, invocationGRPCStatus)
 
 	go func() {
 		log.Debugf("removing %s", vmId)
-		if snap == nil && err == nil && recorder.status == http.StatusOK {
+		if snap == nil && err == nil && invocationOK {
 			snap, err = snapMgr.InitSnapshot(rev, image)
 			if err != nil && strings.Contains(err.Error(), "Snapshot") && strings.Contains(err.Error(), "already exists") {
 				return
@@ -218,6 +273,8 @@ func handler(w http.ResponseWriter, r *http.Request) {
 				log.Errorf("upload error: %v", err)
 			}
 			log.Debugf("finished snapshotting %s", vmId)
+		} else if snap == nil && !invocationOK {
+			log.Warnf("not snapshotting VM %s after failed invocation (HTTP status %d, gRPC status %q)", vmId, recorder.status, invocationGRPCStatus)
 		}
 		orch.StopSingleVM(ctx, vmId)
 		if *cleaning {
@@ -252,6 +309,7 @@ func main() {
 	netPoolSize := flag.Int("netPoolSize", 10, "Amount of network configs to preallocate in a pool")
 	vethPrefix := flag.String("vethPrefix", "172.17", "Prefix for IP addresses of veth devices, expected subnet is /16")
 	clonePrefix := flag.String("clonePrefix", "172.18", "Prefix for node-accessible IP addresses of uVMs, expected subnet is /16")
+	vmMemSizeMib := flag.Uint("vmMemSizeMib", 512, "Memory size in MiB for newly created microVMs")
 	dockerCredentials := flag.String("dockerCredentials", `{"docker-credentials":{"ghcr.io":{"username":"","password":""}}}`, "Docker credentials for pulling images from inside a microVM") // https://github.com/firecracker-microvm/firecracker-containerd/blob/main/docker-credential-mmds
 	minioCredentials := flag.String("minioCredentials", "10.0.1.1:9000;minio;minio123", "Minio credentials for uploading/downloading remote firecracker snapshots. Format: <minioAddr>;<minioAccessKey>;<minioSecretKey>")
 	endpoint := flag.String("endpoint", "localhost:8080", "Endpoint for the relay server")
@@ -264,6 +322,9 @@ func main() {
 	threads := flag.Int("j", 8, "How many concurrent uploads/downloads to run when transferring snapshots")
 	encryption := flag.Bool("encryption", false, "Enable snapshot encryption")
 	flag.Parse()
+	if *vmMemSizeMib == 0 || uint64(*vmMemSizeMib) > uint64(^uint32(0)) {
+		log.Fatalf("vmMemSizeMib must be between 1 and %d", uint64(^uint32(0)))
+	}
 
 	imageMap = make(map[string]string)
 	data, err := os.ReadFile("image_map.json")
@@ -325,6 +386,7 @@ func main() {
 		ctriface.WithNetPoolSize(*netPoolSize),
 		ctriface.WithVethPrefix(*vethPrefix),
 		ctriface.WithClonePrefix(*clonePrefix),
+		ctriface.WithVMMemSizeMib(uint32(*vmMemSizeMib)),
 		ctriface.WithDockerCredentials(*dockerCredentials),
 		ctriface.WithMinioAddr(minioAddr),
 		ctriface.WithMinioAccessKey(minioAccessKey),

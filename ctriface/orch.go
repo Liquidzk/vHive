@@ -338,6 +338,7 @@ type Orchestrator struct {
 	threads           int
 	encryption        bool
 	cleanChunks       bool
+	vmMemSizeMib      uint32
 	dns               []string
 
 	vethPrefix  string
@@ -368,6 +369,7 @@ func NewOrchestrator(snapshotter, hostIface string, opts ...OrchestratorOption) 
 	o.minioAddr = "10.96.0.46:9000"
 	o.minioAccessKey = "minio"
 	o.minioSecretKey = "minio123"
+	o.vmMemSizeMib = 512
 
 	o.dns = getK8sDNS()
 
