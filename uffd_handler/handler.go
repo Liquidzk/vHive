@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -140,6 +141,35 @@ type WorkingSetSource struct {
 	hashToIndex map[string]uint64
 }
 
+type workingSetCopy struct {
+	dst uint64
+	src uint64
+	len uint64
+}
+
+func coalesceWorkingSetCopies(copies []workingSetCopy, pageSize uint64) []workingSetCopy {
+	if len(copies) == 0 {
+		return nil
+	}
+	sort.Slice(copies, func(i, j int) bool { return copies[i].dst < copies[j].dst })
+
+	coalesced := make([]workingSetCopy, 0, len(copies))
+	for _, current := range copies {
+		if current.len == 0 || current.len%pageSize != 0 {
+			continue
+		}
+		last := len(coalesced) - 1
+		if last >= 0 &&
+			coalesced[last].dst+coalesced[last].len == current.dst &&
+			coalesced[last].src+coalesced[last].len == current.src {
+			coalesced[last].len += current.len
+			continue
+		}
+		coalesced = append(coalesced, current)
+	}
+	return coalesced
+}
+
 // PageOperations encapsulates the page-level operations for UFFD handling.
 // This structure is shared across multiple UFFD handlers to provide consistent
 // behavior without duplicating configuration.
@@ -252,6 +282,7 @@ func (po *PageOperations) PopulateFromFile(uffd int, region *GuestRegionUffdMapp
 func (po *PageOperations) insertWorkingSet(uffd int, region *GuestRegionUffdMapping) {
 	startTime := time.Now()
 	var counter int32
+	var copyOperations int32
 	var usedChunks sync.Map
 
 	defer func() {
@@ -259,7 +290,11 @@ func (po *PageOperations) insertWorkingSet(uffd int, region *GuestRegionUffdMapp
 		count := ""
 		if po.baseRootfsSource != nil || po.imageSource != nil || po.privateSource != nil {
 			mode = "(Split WS) "
-			count = fmt.Sprintf(", private page count: %d", len(po.privateSource.pfnToIndex))
+			privatePages := 0
+			if po.privateSource != nil {
+				privatePages = len(po.privateSource.pfnToIndex)
+			}
+			count = fmt.Sprintf(", private page count: %d, UFFD copy operations: %d", privatePages, atomic.LoadInt32(&copyOperations))
 		} else if po.legacyWSContentPtr != 0 {
 			mode = "(Monolithic WS) "
 		} else if po.lazy {
@@ -274,14 +309,46 @@ func (po *PageOperations) insertWorkingSet(uffd int, region *GuestRegionUffdMapp
 		po.logger.Infof("%sPre-inserting working set of %d pages in %v%s", mode, atomic.LoadInt32(&counter), time.Since(startTime), count)
 	}()
 
-	idxCh := make(chan int, len(po.workingSet))
+	type fallbackPage struct {
+		idx int
+		pfn uint64
+	}
+
+	sourceCopies := make([]workingSetCopy, 0, len(po.workingSet))
+	fallbackPages := make([]fallbackPage, 0, len(po.workingSet))
+	seen := make(map[uint64]struct{}, len(po.workingSet))
 	for i, pfn := range po.workingSet {
+		if _, ok := seen[pfn]; ok {
+			continue
+		}
+		seen[pfn] = struct{}{}
 		pageAddr := pfn * po.pageSize
 		if pageAddr >= region.Offset && pageAddr < region.Offset+region.Size {
-			idxCh <- i
+			if wsSrc, ok := po.getWorkingSetSourceAddress(pfn); ok {
+				sourceCopies = append(sourceCopies, workingSetCopy{
+					dst: pageAddr + region.BaseHostVirtAddr,
+					src: uint64(wsSrc),
+					len: po.pageSize,
+				})
+			} else {
+				fallbackPages = append(fallbackPages, fallbackPage{idx: i, pfn: pfn})
+			}
 		}
 	}
-	close(idxCh)
+	sourceCopies = coalesceWorkingSetCopies(sourceCopies, po.pageSize)
+
+	type insertJob struct {
+		copy     workingSetCopy
+		fallback *fallbackPage
+	}
+	jobCh := make(chan insertJob, len(sourceCopies)+len(fallbackPages))
+	for _, copyJob := range sourceCopies {
+		jobCh <- insertJob{copy: copyJob}
+	}
+	for i := range fallbackPages {
+		jobCh <- insertJob{fallback: &fallbackPages[i]}
+	}
+	close(jobCh)
 
 	var wg sync.WaitGroup
 	wg.Add(po.threads)
@@ -289,8 +356,30 @@ func (po *PageOperations) insertWorkingSet(uffd int, region *GuestRegionUffdMapp
 	for w := 0; w < po.threads; w++ {
 		go func() {
 			defer wg.Done()
-			for idx := range idxCh {
-				pfn := po.workingSet[idx]
+			for job := range jobCh {
+				if job.fallback == nil {
+					pages := int32(job.copy.len / po.pageSize)
+					atomic.AddInt32(&counter, pages)
+					atomic.AddInt32(&copyOperations, 1)
+					if po.copyWorkingSetRange(uffd, job.copy) {
+						continue
+					}
+
+					// A page can race with the pre-insert. Retry a failed batch one
+					// page at a time so one EEXIST/EAGAIN does not discard the rest.
+					for offset := uint64(0); offset < job.copy.len; offset += po.pageSize {
+						atomic.AddInt32(&copyOperations, 1)
+						po.copyWorkingSetRange(uffd, workingSetCopy{
+							dst: job.copy.dst + offset,
+							src: job.copy.src + offset,
+							len: po.pageSize,
+						})
+					}
+					continue
+				}
+
+				idx := job.fallback.idx
+				pfn := job.fallback.pfn
 				pageAddr := pfn * po.pageSize
 				atomic.AddInt32(&counter, 1)
 
@@ -316,22 +405,39 @@ func (po *PageOperations) insertWorkingSet(uffd int, region *GuestRegionUffdMapp
 					src = po.backingBuffer + uintptr(pageAddr)
 				}
 
-				copy := UffdIoCopy{
-					Dst:  pageAddr + region.BaseHostVirtAddr,
-					Src:  uint64(src),
-					Len:  po.pageSize,
-					Mode: UFFDIO_COPY_MODE_DONTWAKE,
-				}
-
-				_, _, errno := unix.Syscall(unix.SYS_IOCTL, uintptr(uffd), UFFDIO_COPY, uintptr(unsafe.Pointer(&copy)))
-				if errno != 0 && errno != unix.EAGAIN && errno != unix.EEXIST {
-					po.logger.Errorf("UFFD copy failed: %v", errno)
-				}
+				atomic.AddInt32(&copyOperations, 1)
+				po.copyWorkingSetRange(uffd, workingSetCopy{
+					dst: pageAddr + region.BaseHostVirtAddr,
+					src: uint64(src),
+					len: po.pageSize,
+				})
 			}
 		}()
 	}
 
 	wg.Wait()
+}
+
+func (po *PageOperations) copyWorkingSetRange(uffd int, job workingSetCopy) bool {
+	copy := UffdIoCopy{
+		Dst:  job.dst,
+		Src:  job.src,
+		Len:  job.len,
+		Mode: UFFDIO_COPY_MODE_DONTWAKE,
+	}
+	_, _, errno := unix.Syscall(unix.SYS_IOCTL, uintptr(uffd), UFFDIO_COPY, uintptr(unsafe.Pointer(&copy)))
+	if errno == unix.EAGAIN || errno == unix.EEXIST {
+		return false
+	}
+	if errno != 0 {
+		po.logger.Errorf("UFFD copy failed: %v", errno)
+		return false
+	}
+	if copy.Copy != int64(job.len) {
+		po.logger.Errorf("UFFD copy returned %d bytes, expected %d", copy.Copy, job.len)
+		return false
+	}
+	return true
 }
 
 func (po *PageOperations) mapChunk(hashKey [md5.Size]byte) (uintptr, error) {

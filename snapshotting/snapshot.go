@@ -110,6 +110,18 @@ func (snp *Snapshot) GetWSPrivateIndexFilePath() string {
 	return filepath.Join(snp.snapDir, "working_set_pages_index_private")
 }
 
+func (snp *Snapshot) GetWSPrivatePlanBBasePath() string {
+	return filepath.Join(snp.snapDir, "working_set_pages_content_private.planb")
+}
+
+func (snp *Snapshot) GetWSPrivatePlanBSnapshotPath() string {
+	return snp.GetWSPrivatePlanBBasePath() + ".snapshot"
+}
+
+func (snp *Snapshot) GetWSPrivatePlanBPartitionsPath() string {
+	return snp.GetWSPrivatePlanBBasePath() + ".partitions"
+}
+
 // SerializeSnapInfo serializes the snapshot info using gob. This can be useful for remote snapshots
 func (snp *Snapshot) SerializeSnapInfo() error {
 	file, err := os.Create(snp.GetInfoFilePath())

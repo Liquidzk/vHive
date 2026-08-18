@@ -53,6 +53,7 @@ import (
 
 	log "github.com/sirupsen/logrus"
 
+	"github.com/vhive-serverless/vhive/snapshotting/planb"
 	"github.com/vhive-serverless/vhive/storage"
 	"golang.org/x/sys/unix"
 )
@@ -755,10 +756,29 @@ type SnapshotManager struct {
 	wsImageCache  sync.Map // image name -> *WorkingSetContentSource
 	wsWarnOnce    sync.Once
 	wsPersistLock sync.Map // image name -> *sync.Mutex
+	planBEnabled  bool
+	planBOptions  planb.Options
 
 	// Used to store remote snapshots
 	storage storage.ObjectStorage
 	initWg  sync.WaitGroup
+}
+
+func (mgr *SnapshotManager) ConfigurePlanB(codecName string, maxHardwareJobs uint8) error {
+	if !planb.Available() {
+		return planb.ErrUnavailable
+	}
+	codec, err := planb.ParseCodec(codecName)
+	if err != nil {
+		return err
+	}
+	if maxHardwareJobs == 0 {
+		maxHardwareJobs = 1
+	}
+	mgr.planBOptions = planb.Options{Codec: codec, MaxHardwareJobs: maxHardwareJobs}
+	mgr.planBEnabled = true
+	log.Infof("Plan B private working-set codec enabled: codec=%s jobs=%d", codec, maxHardwareJobs)
+	return nil
 }
 
 func readTarChunkHashes(tarFilePath string, chunkSize uint64) (map[[16]byte]bool, error) {
@@ -1251,6 +1271,11 @@ func (mgr *SnapshotManager) UploadSnapshot(revision string) error {
 		snap.GetSnapshotFilePath(),
 		snap.GetInfoFilePath(),
 	}
+	if _, statErr := os.Stat(snap.GetPatchFilePath()); statErr == nil {
+		files = append(files, snap.GetPatchFilePath())
+	} else if !os.IsNotExist(statErr) {
+		return errors.Wrapf(statErr, "checking container patch for snapshot %s", revision)
+	}
 
 	for _, filePath := range files {
 		if err := mgr.uploadFile(revision, filePath); err != nil {
@@ -1367,7 +1392,17 @@ func (mgr *SnapshotManager) UploadWorkingSet(revision string) error {
 	}
 	_ = mgr.wsRegistry.AddAccess(revision)
 
-	if mgr.optimizeWS && mgr.chunkSize == 4096 {
+	if mgr.optimizeWS {
+		_, fullMemoryErr := os.Stat(snap.GetMemFilePath())
+		hasFullMemory := fullMemoryErr == nil
+		if mgr.chunkSize != 4096 && !hasFullMemory {
+			log.Warnf("Skipping split working-set generation for revision %s: chunk size is %d and the full memory file is unavailable", revision, mgr.chunkSize)
+			return nil
+		}
+		canClassifyShared := mgr.chunkSize == 4096
+		if !canClassifyShared {
+			log.Warnf("Generating a private-only working set for revision %s from retained full memory; 4-KiB provenance classification is unavailable with chunk size %d", revision, mgr.chunkSize)
+		}
 		wsFile, err := os.Open(snap.GetWSFilePath())
 		if err != nil {
 			return errors.Wrapf(err, "opening working set file")
@@ -1538,15 +1573,19 @@ func (mgr *SnapshotManager) UploadWorkingSet(revision string) error {
 			copy(pageCopy, page)
 			hash := md5.Sum(pageCopy)
 
-			if mgr.isBaseRootfsChunk(hash) {
+			if canClassifyShared && mgr.isBaseRootfsChunk(hash) {
 				appendSharedPage(baseBuild, hash, pageCopy)
-			} else if mgr.isImageChunk(hash, imageName) {
+			} else if canClassifyShared && mgr.isImageChunk(hash, imageName) {
 				appendSharedPage(imageBuild, hash, pageCopy)
 			} else {
 				appendPage(privateBuild, pfn, pageCopy)
 			}
 		}
 
+		privateBuild.pfns, privateBuild.content, err = sortPrivateWorkingSet(privateBuild.pfns, privateBuild.content)
+		if err != nil {
+			return errors.Wrapf(err, "sorting private working set")
+		}
 		privateIndex, err := buildWSPFNIndexCSV(privateBuild.pfns)
 		if err != nil {
 			return errors.Wrapf(err, "building private working set index")
@@ -1562,6 +1601,17 @@ func (mgr *SnapshotManager) UploadWorkingSet(revision string) error {
 		}
 		if err := mgr.uploadFile(revision, snap.GetWSPrivateIndexFilePath()); err != nil {
 			return errors.Wrapf(err, "uploading private working set index file")
+		}
+		if mgr.planBEnabled && len(privateBuild.content) > 0 {
+			if err := mgr.encodePlanBPrivateWorkingSet(snap, privateBuild.content); err != nil {
+				return errors.Wrapf(err, "encoding Plan B private working set")
+			}
+			if err := mgr.uploadFile(revision, snap.GetWSPrivatePlanBSnapshotPath()); err != nil {
+				return errors.Wrapf(err, "uploading Plan B private payload")
+			}
+			if err := mgr.uploadFile(revision, snap.GetWSPrivatePlanBPartitionsPath()); err != nil {
+				return errors.Wrapf(err, "uploading Plan B private partition table")
+			}
 		}
 		_ = mgr.wsRegistry.AddAccess(revision)
 
@@ -1627,6 +1677,52 @@ func buildWSPFNIndexCSV(pfns []uint64) ([]byte, error) {
 		return nil, err
 	}
 	return buf.Bytes(), nil
+}
+
+func sortPrivateWorkingSet(pfns []uint64, content []byte) ([]uint64, []byte, error) {
+	if len(content) != len(pfns)*4096 {
+		return nil, nil, fmt.Errorf("private content has %d bytes for %d PFNs", len(content), len(pfns))
+	}
+	order := make([]int, len(pfns))
+	for i := range order {
+		order[i] = i
+	}
+	sort.Slice(order, func(i, j int) bool { return pfns[order[i]] < pfns[order[j]] })
+
+	sortedPFNs := make([]uint64, len(pfns))
+	sortedContent := make([]byte, len(content))
+	for outputPage, inputPage := range order {
+		pfn := pfns[inputPage]
+		if outputPage > 0 && sortedPFNs[outputPage-1] == pfn {
+			return nil, nil, fmt.Errorf("duplicate private PFN %d", pfn)
+		}
+		sortedPFNs[outputPage] = pfn
+		copy(sortedContent[outputPage*4096:(outputPage+1)*4096], content[inputPage*4096:(inputPage+1)*4096])
+	}
+	return sortedPFNs, sortedContent, nil
+}
+
+func (mgr *SnapshotManager) encodePlanBPrivateWorkingSet(snap *Snapshot, content []byte) error {
+	basePath := snap.GetWSPrivatePlanBBasePath()
+	_ = os.Remove(snap.GetWSPrivatePlanBSnapshotPath())
+	_ = os.Remove(snap.GetWSPrivatePlanBPartitionsPath())
+	restorer, err := planb.Open(basePath, mgr.planBOptions)
+	if err != nil {
+		return err
+	}
+	defer restorer.Close()
+	start := time.Now()
+	if err := restorer.Compress(content); err != nil {
+		return err
+	}
+	payloadInfo, _ := os.Stat(snap.GetWSPrivatePlanBSnapshotPath())
+	payloadBytes := int64(0)
+	if payloadInfo != nil {
+		payloadBytes = payloadInfo.Size()
+	}
+	log.Infof("Plan B private WS compressed: revision=%s codec=%s input_bytes=%d payload_bytes=%d elapsed=%v",
+		snap.GetId(), mgr.planBOptions.Codec, len(content), payloadBytes, time.Since(start))
+	return nil
 }
 
 func buildWSHashIndexCSV(hashes []string) ([]byte, error) {
@@ -2092,6 +2188,21 @@ func (mgr *SnapshotManager) DownloadSnapshot(revision string) (*Snapshot, error)
 			run: func() error {
 				snapshotPath := snap.GetSnapshotFilePath()
 				return mgr.downloadFile(revision, snapshotPath, filepath.Base(snapshotPath))
+			},
+		},
+		{
+			name: "container patch",
+			run: func() error {
+				patchPath := snap.GetPatchFilePath()
+				objectKey := mgr.getObjectKey(revision, filepath.Base(patchPath))
+				exists, existsErr := mgr.storage.Exists(objectKey)
+				if existsErr != nil {
+					return existsErr
+				}
+				if !exists {
+					return nil
+				}
+				return mgr.downloadFile(revision, patchPath, filepath.Base(patchPath))
 			},
 		},
 	}
@@ -2743,21 +2854,135 @@ func (mgr *SnapshotManager) GetWorkingSetContentManaged(snap *Snapshot) ([]byte,
 	return nil, combineReleaseFuncs(releaseFn, fallbackRelease), fallbackErr
 }
 
+func privateWorkingSetSize(index []byte) (uint64, error) {
+	records, err := csv.NewReader(bytes.NewReader(index)).ReadAll()
+	if err != nil {
+		return 0, err
+	}
+	if len(records) == 0 || len(records[0]) == 0 || records[0][0] != "pfn" {
+		return 0, errors.New("private working-set index must start with a pfn header")
+	}
+	pages := uint64(0)
+	for _, record := range records[1:] {
+		if len(record) == 0 || record[0] == "" {
+			continue
+		}
+		if _, err := strconv.ParseUint(record[0], 10, 64); err != nil {
+			return 0, err
+		}
+		pages++
+	}
+	if pages == 0 || pages > ^uint64(0)/4096 {
+		return 0, errors.New("private working-set index has no valid pages or is too large")
+	}
+	return pages * 4096, nil
+}
+
+func persistPlanBFile(path string, content []byte) error {
+	if info, err := os.Stat(path); err == nil && info.Size() == int64(len(content)) {
+		return nil
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+		return err
+	}
+	tmp, err := os.CreateTemp(filepath.Dir(path), ".planb-download-*")
+	if err != nil {
+		return err
+	}
+	tmpPath := tmp.Name()
+	defer os.Remove(tmpPath)
+	if _, err := tmp.Write(content); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	if err := os.Chmod(tmpPath, 0644); err != nil {
+		return err
+	}
+	return os.Rename(tmpPath, path)
+}
+
+func (mgr *SnapshotManager) ensurePlanBFile(snap *Snapshot, path string) (func(), error) {
+	content, release, err := mgr.GetSnapshotFileContentManaged(snap, path)
+	if release == nil {
+		release = func() {}
+	}
+	if err != nil {
+		return release, err
+	}
+	if err := persistPlanBFile(path, content); err != nil {
+		release()
+		return func() {}, err
+	}
+	return release, nil
+}
+
+func (mgr *SnapshotManager) getPlanBPrivateContent(snap *Snapshot, index []byte) ([]byte, func(), error) {
+	expectedBytes, err := privateWorkingSetSize(index)
+	if err != nil {
+		return nil, func() {}, err
+	}
+	payloadRelease, err := mgr.ensurePlanBFile(snap, snap.GetWSPrivatePlanBSnapshotPath())
+	if err != nil {
+		return nil, payloadRelease, err
+	}
+	partitionsRelease, err := mgr.ensurePlanBFile(snap, snap.GetWSPrivatePlanBPartitionsPath())
+	if err != nil {
+		payloadRelease()
+		return nil, partitionsRelease, err
+	}
+	defer payloadRelease()
+	defer partitionsRelease()
+
+	restorer, err := planb.Open(snap.GetWSPrivatePlanBBasePath(), mgr.planBOptions)
+	if err != nil {
+		return nil, func() {}, err
+	}
+	defer restorer.Close()
+	start := time.Now()
+	region, err := restorer.Decompress(expectedBytes)
+	if err != nil {
+		return nil, func() {}, err
+	}
+	metrics := restorer.Metrics()
+	log.Infof("Plan B private WS decompressed: revision=%s codec=%s bytes=%d decompress_us=%d total_us=%d elapsed=%v",
+		snap.GetId(), mgr.planBOptions.Codec, expectedBytes, metrics.Decompress, metrics.MemRestoreTotal, time.Since(start))
+	return region.Bytes(), region.Free, nil
+}
+
 func (mgr *SnapshotManager) GetWorkingSetContentSourcesManaged(snap *Snapshot) (*WorkingSetContentSources, func(), error) {
 	if mgr.securityMode == "full" {
 		return nil, func() {}, nil
-	}
-
-	privateContent, privateContentRelease, err := mgr.GetWorkingSetContentManaged(snap)
-	if err != nil {
-		privateContent = nil
-		privateContentRelease = func() {}
 	}
 
 	privateIndex, privateIndexRelease, err := mgr.GetSnapshotFileContentManaged(snap, snap.GetWSPrivateIndexFilePath())
 	if err != nil {
 		privateIndex = nil
 		privateIndexRelease = func() {}
+	}
+
+	var privateContent []byte
+	privateContentRelease := func() {}
+	if mgr.planBEnabled && len(privateIndex) > 0 {
+		privateContent, privateContentRelease, err = mgr.getPlanBPrivateContent(snap, privateIndex)
+		if err != nil {
+			log.Warnf("Plan B private WS unavailable for revision %s, falling back to raw content: %v", snap.GetId(), err)
+			privateContent = nil
+			privateContentRelease = func() {}
+		}
+	}
+	if len(privateContent) == 0 {
+		privateContent, privateContentRelease, err = mgr.GetWorkingSetContentManaged(snap)
+		if err != nil {
+			privateContent = nil
+			privateContentRelease = func() {}
+		}
 	}
 
 	baseSource, err := mgr.getSharedWSSource("")

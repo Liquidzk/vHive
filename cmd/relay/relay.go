@@ -148,8 +148,10 @@ func handler(w http.ResponseWriter, r *http.Request) {
 	if snap, err = snapMgr.AcquireSnapshot(rev); err == nil { // local case
 		log.Debugf("Using snapshot for rev %s", rev)
 		resp, metric, err = orch.LoadSnapshot(ctx, snap, false, false)
-		log.Debugf("Loaded snapshot for rev %s in %v", rev, metric.Total())
-		metric.PrintAll()
+		if err == nil && metric != nil {
+			log.Debugf("Loaded snapshot for rev %s in %v", rev, metric.Total())
+			metric.PrintAll()
+		}
 	} else if ok, err = snapMgr.SnapshotExists(rev); err == nil && ok { // remote case
 		log.Debugf("Using remote snapshot for rev %s", rev)
 		startDownload := time.Now()
@@ -170,10 +172,13 @@ func handler(w http.ResponseWriter, r *http.Request) {
 		if err != nil {
 			log.Errorf("LoadSnapshot error is %v", err)
 			http.Error(w, fmt.Sprintf("Snapshot Load Error, metric: %p", metric), http.StatusInternalServerError)
+			return
 		}
 		log.Debugf("Snapshot Load Result: metric: %p", metric)
-		log.Debugf("Loaded snapshot for rev %s in %v", rev, metric.Total())
-		metric.PrintAll()
+		if metric != nil {
+			log.Debugf("Loaded snapshot for rev %s in %v", rev, metric.Total())
+			metric.PrintAll()
+		}
 	} else if *baseSnap { // start from base snapshot case
 		log.Debugf("No snapshot for rev %s, starting from base snapshot", rev)
 		resp, err = orch.StartWithBaseSnapshot(ctx, image, envArr, argsArr)
@@ -305,6 +310,9 @@ func main() {
 	isWSEnabled := flag.Bool("ws", false, "Enable working set pulling for UPFs in lazy mode")
 	isWSCoalescing := flag.Bool("wsCoalescing", false, "Enable coalescing of working set pulls for multiple UPF-enabled VMs")
 	isWSRecording := flag.Bool("wsRecording", false, "Enable recording of working set pages accessed during function execution")
+	planBPrivateWS := flag.Bool("planBPrivateWS", false, "Compress and restore the private working set through the optional Plan B codec")
+	planBCodec := flag.String("planBCodec", "iaa_deflate", "Plan B codec: iaa_deflate, sw_deflate, zstd_1, or zstd_3")
+	planBJobs := flag.Uint("planBJobs", 1, "Maximum concurrent IAA jobs for the Plan B codec")
 	hostIface := flag.String("hostIface", "", "Host net-interface for the VMs to bind to for internet access")
 	netPoolSize := flag.Int("netPoolSize", 10, "Amount of network configs to preallocate in a pool")
 	vethPrefix := flag.String("vethPrefix", "172.17", "Prefix for IP addresses of veth devices, expected subnet is /16")
@@ -324,6 +332,12 @@ func main() {
 	flag.Parse()
 	if *vmMemSizeMib == 0 || uint64(*vmMemSizeMib) > uint64(^uint32(0)) {
 		log.Fatalf("vmMemSizeMib must be between 1 and %d", uint64(^uint32(0)))
+	}
+	if *planBJobs == 0 || *planBJobs > uint(^uint8(0)) {
+		log.Fatalf("planBJobs must be between 1 and %d", uint(^uint8(0)))
+	}
+	if *planBPrivateWS && (!*isUPFEnabled || !*isLazyMode || !*isWSEnabled || !*isWSCoalescing) {
+		log.Fatal("planBPrivateWS requires -upf -lazy -ws -wsCoalescing")
 	}
 
 	imageMap = make(map[string]string)
@@ -401,6 +415,11 @@ func main() {
 	)
 	// defer orch.Cleanup()
 	snapMgr = orch.GetSnapshotManager()
+	if *planBPrivateWS {
+		if err := snapMgr.ConfigurePlanB(*planBCodec, uint8(*planBJobs)); err != nil {
+			log.Fatalf("failed to enable Plan B private working set: %v", err)
+		}
+	}
 	time.Sleep(1 * time.Second) // Wait for orchestrator to fully initialize
 
 	if *baseSnap {

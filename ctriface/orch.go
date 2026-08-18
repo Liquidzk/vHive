@@ -174,33 +174,22 @@ func (sp *ShimPool) ReleaseShim(ctx context.Context, vmID string) error {
 	return sp.removeShim(ctx, vmID)
 }
 
-// createShim creates a new shim using the PrepareShim API
+// createShim reserves a VM ID and its network configuration.
 func (sp *ShimPool) createShim(ctx context.Context, vmID string) error {
-	sp.logger.WithField("vmID", vmID).Debug("Creating new shim")
+	sp.logger.WithField("vmID", vmID).Debug("Preparing VM slot")
 
-	ctx = namespaces.WithNamespace(ctx, vmID)
-	// Ensure VM structure and network are prepared before preparing shim
+	// PrepareShim cannot be combined with the CreateVM call in StartVM on the
+	// firecracker-containerd version used by the SnapShare evaluation nodes:
+	// both calls create ctrstub0 and CreateVM fails with EEXIST. Keep the ID and
+	// network pooling here, and let CreateVM create the actual shim and drives.
 	if sp.prepareVM != nil {
 		if err := sp.prepareVM(vmID); err != nil {
-			sp.logger.WithField("vmID", vmID).WithError(err).Error("Failed to prepare VM for shim")
+			sp.logger.WithField("vmID", vmID).WithError(err).Error("Failed to prepare VM slot")
 			return err
 		}
 	}
 
-	req := &proto.PrepareShimRequest{
-		VMID: vmID,
-	}
-	if sp.getVMConfig != nil {
-		req.CreateVmRequest = sp.getVMConfig(vmID)
-	}
-
-	_, err := sp.fcClient.PrepareShim(ctx, req)
-	if err != nil {
-		sp.logger.WithField("vmID", vmID).WithError(err).Error("Failed to prepare shim")
-		return err
-	}
-
-	sp.logger.WithField("vmID", vmID).Debug("Successfully created shim")
+	sp.logger.WithField("vmID", vmID).Debug("Successfully prepared VM slot")
 	return nil
 }
 
