@@ -15,10 +15,16 @@ spec:
       labels:
         app: registry
     spec:
+      nodeSelector:
+        node-role.kubernetes.io/control-plane: ""
+      tolerations:
+      - key: node-role.kubernetes.io/control-plane
+        operator: Exists
+        effect: NoSchedule
       terminationGracePeriodSeconds: 10
       containers:
       - name: registry
-        image: registry:2.6.2
+        image: registry:2.8.3
         volumeMounts:
         - name: repo-vol
           mountPath: "/var/lib/registry"
@@ -42,4 +48,3 @@ spec:
   ports:
   - port: 5000
     targetPort: 5000
-    
