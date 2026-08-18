@@ -39,7 +39,6 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
-	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -1313,6 +1312,7 @@ func (mgr *SnapshotManager) UpdateWorkingSet(revision string, diffFile string) e
 	}
 
 	ws_pages := make([]uint64, 0, len(records))
+	seenPages := make(map[uint64]struct{}, len(records))
 	for i := 1; i < len(records); i++ {
 		if len(records[i]) == 0 {
 			continue
@@ -1321,6 +1321,10 @@ func (mgr *SnapshotManager) UpdateWorkingSet(revision string, diffFile string) e
 		if err != nil {
 			continue
 		}
+		if _, exists := seenPages[pfn]; exists {
+			continue
+		}
+		seenPages[pfn] = struct{}{}
 		ws_pages = append(ws_pages, pfn)
 	}
 
@@ -1348,8 +1352,9 @@ func (mgr *SnapshotManager) UpdateWorkingSet(revision string, diffFile string) e
 			continue
 		}
 
-		if !slices.Contains(ws_pages, pfn) {
+		if _, exists := seenPages[pfn]; !exists {
 			cnt++
+			seenPages[pfn] = struct{}{}
 			ws_pages = append(ws_pages, pfn)
 		}
 	}
@@ -1436,6 +1441,7 @@ func (mgr *SnapshotManager) UploadWorkingSet(revision string) error {
 			return errors.Wrapf(err, "reading working set CSV")
 		}
 
+		seenPages := make(map[uint64]struct{}, len(records))
 		if mgr.securityMode == "full" {
 			contentPath := snap.GetWSContentFilePath()
 			contentFile, err := os.Create(contentPath)
@@ -1454,6 +1460,10 @@ func (mgr *SnapshotManager) UploadWorkingSet(revision string) error {
 				if parseErr != nil {
 					continue
 				}
+				if _, exists := seenPages[pfn]; exists {
+					continue
+				}
+				seenPages[pfn] = struct{}{}
 
 				if !useChunks {
 					offset := int64(pfn * 4096)
@@ -1539,6 +1549,10 @@ func (mgr *SnapshotManager) UploadWorkingSet(revision string) error {
 			if parseErr != nil {
 				continue
 			}
+			if _, exists := seenPages[pfn]; exists {
+				continue
+			}
+			seenPages[pfn] = struct{}{}
 
 			if !useChunks {
 				offset := int64(pfn * 4096)

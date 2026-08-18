@@ -1149,11 +1149,16 @@ func (o *Orchestrator) LoadSnapshot(ctx context.Context, snap *snapshotting.Snap
 			} else if o.isWSRecording && snap.GetId() != "base" {
 				if hasWSPagesFile {
 					logger.Debugf("Updating WS pages files with new accesses for snap %s after UFFD handler finished", snap.GetId())
-					o.snapshotManager.UpdateWorkingSet(snap.GetId(), memPathForTrace+".touched")
+					if err := o.snapshotManager.UpdateWorkingSet(snap.GetId(), memPathForTrace+".touched"); err != nil {
+						logger.Errorf("Failed to update and upload working set for snap %s: %v", snap.GetId(), err)
+					}
 				} else {
 					logger.Debugf("Uploading WS file for snap %s after UFFD handler finished", snap.GetId())
-					os.Rename(memPathForTrace+".touched", snap.GetWSFilePath())
-					o.snapshotManager.UploadWorkingSet(snap.GetId())
+					if err := os.Rename(memPathForTrace+".touched", snap.GetWSFilePath()); err != nil {
+						logger.Errorf("Failed to install recorded working set for snap %s: %v", snap.GetId(), err)
+					} else if err := o.snapshotManager.UploadWorkingSet(snap.GetId()); err != nil {
+						logger.Errorf("Failed to upload working set for snap %s: %v", snap.GetId(), err)
+					}
 					// o.snapshotManager.DeleteSnapshot(snap.GetId())
 					// o.snapshotManager.CleanChunks()
 				}
