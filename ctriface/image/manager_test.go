@@ -25,14 +25,14 @@ package image
 import (
 	"context"
 	"fmt"
-	"github.com/containerd/containerd"
-	"github.com/containerd/containerd/namespaces"
 	"os"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/containerd/containerd"
 	ctrdlog "github.com/containerd/containerd/log"
+	"github.com/containerd/containerd/namespaces"
 	log "github.com/sirupsen/logrus"
 	"github.com/stretchr/testify/require"
 )
@@ -67,6 +67,38 @@ func TestMain(m *testing.M) {
 	log.SetLevel(log.InfoLevel)
 
 	os.Exit(m.Run())
+}
+
+func TestIsLocalDomain(t *testing.T) {
+	tests := []struct {
+		name      string
+		imageName string
+		expected  bool
+	}{
+		{
+			name:      "in-cluster registry with port",
+			imageName: "docker-registry.registry.svc.cluster.local:5000/repo/image:tag",
+			expected:  true,
+		},
+		{
+			name:      "local registry URL",
+			imageName: "http://dev.local:5000/repo/image:tag",
+			expected:  true,
+		},
+		{
+			name:      "public registry",
+			imageName: "docker.io/library/alpine:latest",
+			expected:  false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			actual, err := isLocalDomain(tt.imageName)
+			require.NoError(t, err)
+			require.Equal(t, tt.expected, actual)
+		})
+	}
 }
 
 func TestSingleConcurrent(t *testing.T) {
