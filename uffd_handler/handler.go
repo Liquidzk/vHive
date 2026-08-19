@@ -182,7 +182,6 @@ type PageOperations struct {
 	privateSource      *WorkingSetSource
 	pageSize           uint64
 	workingSet         []uint64
-	firstPageFaultOnce *sync.Once
 	lazy               bool
 	mappedChunks       sync.Map
 	keyLocks           sync.Map
@@ -208,7 +207,6 @@ func NewPageOperations(backingBuffer uintptr, legacyWSContent []byte, baseRootfs
 		privateSource:      privateSource,
 		pageSize:           pageSize,
 		workingSet:         workingSet,
-		firstPageFaultOnce: &sync.Once{},
 		lazy:               lazy,
 		snapMgr:            snapMgr,
 		threads:            threads,
@@ -218,10 +216,6 @@ func NewPageOperations(backingBuffer uintptr, legacyWSContent []byte, baseRootfs
 
 // PopulateFromFile populates a page from the backing file
 func (po *PageOperations) PopulateFromFile(uffd int, region *GuestRegionUffdMapping, dst uint64, length uint64) bool {
-	po.firstPageFaultOnce.Do(func() {
-		po.insertWorkingSet(uffd, region)
-	})
-
 	offset := dst - region.BaseHostVirtAddr
 
 	src := uintptr(0)
@@ -279,7 +273,18 @@ func (po *PageOperations) PopulateFromFile(uffd int, region *GuestRegionUffdMapp
 	return true
 }
 
-func (po *PageOperations) insertWorkingSet(uffd int, region *GuestRegionUffdMapping) {
+func workingSetDestination(pfn uint64, pageSize uint64, regions []GuestRegionUffdMapping) (uint64, bool) {
+	pageOffset := pfn * pageSize
+	for i := range regions {
+		region := &regions[i]
+		if pageOffset >= region.Offset && pageOffset < region.Offset+region.Size {
+			return region.BaseHostVirtAddr + (pageOffset - region.Offset), true
+		}
+	}
+	return 0, false
+}
+
+func (po *PageOperations) insertWorkingSet(uffd int, regions []GuestRegionUffdMapping) {
 	startTime := time.Now()
 	var counter int32
 	var copyOperations int32
@@ -312,6 +317,7 @@ func (po *PageOperations) insertWorkingSet(uffd int, region *GuestRegionUffdMapp
 	type fallbackPage struct {
 		idx int
 		pfn uint64
+		dst uint64
 	}
 
 	sourceCopies := make([]workingSetCopy, 0, len(po.workingSet))
@@ -322,17 +328,18 @@ func (po *PageOperations) insertWorkingSet(uffd int, region *GuestRegionUffdMapp
 			continue
 		}
 		seen[pfn] = struct{}{}
-		pageAddr := pfn * po.pageSize
-		if pageAddr >= region.Offset && pageAddr < region.Offset+region.Size {
-			if wsSrc, ok := po.getWorkingSetSourceAddress(pfn); ok {
-				sourceCopies = append(sourceCopies, workingSetCopy{
-					dst: pageAddr + region.BaseHostVirtAddr,
-					src: uint64(wsSrc),
-					len: po.pageSize,
-				})
-			} else {
-				fallbackPages = append(fallbackPages, fallbackPage{idx: i, pfn: pfn})
-			}
+		dst, ok := workingSetDestination(pfn, po.pageSize, regions)
+		if !ok {
+			continue
+		}
+		if wsSrc, ok := po.getWorkingSetSourceAddress(pfn); ok {
+			sourceCopies = append(sourceCopies, workingSetCopy{
+				dst: dst,
+				src: uint64(wsSrc),
+				len: po.pageSize,
+			})
+		} else {
+			fallbackPages = append(fallbackPages, fallbackPage{idx: i, pfn: pfn, dst: dst})
 		}
 	}
 	sourceCopies = coalesceWorkingSetCopies(sourceCopies, po.pageSize)
@@ -407,7 +414,7 @@ func (po *PageOperations) insertWorkingSet(uffd int, region *GuestRegionUffdMapp
 
 				atomic.AddInt32(&copyOperations, 1)
 				po.copyWorkingSetRange(uffd, workingSetCopy{
-					dst: pageAddr + region.BaseHostVirtAddr,
+					dst: job.fallback.dst,
 					src: uint64(src),
 					len: po.pageSize,
 				})
@@ -689,12 +696,13 @@ func (r *GuestRegionUffdMapping) Contains(faultPageAddr uint64) bool {
 
 // UffdHandler handles userfaultfd events
 type UffdHandler struct {
-	memRegions   []GuestRegionUffdMapping
-	pageSize     uint64
-	uffd         int
-	removedPages map[uint64]bool
-	tracer       *PageFaultTracer
-	pageOps      *PageOperations
+	memRegions         []GuestRegionUffdMapping
+	pageSize           uint64
+	uffd               int
+	removedPages       map[uint64]bool
+	tracer             *PageFaultTracer
+	pageOps            *PageOperations
+	firstPageFaultOnce sync.Once
 }
 
 // NewUffdHandler creates a new UFFD handler from a Unix socket stream
@@ -805,6 +813,10 @@ func (h *UffdHandler) ServePF(addr uintptr, length uint64) bool {
 	for i := range h.memRegions {
 		region := &h.memRegions[i]
 		if region.Contains(faultPageAddr) {
+			h.firstPageFaultOnce.Do(func() {
+				h.pageOps.insertWorkingSet(h.uffd, h.memRegions)
+			})
+
 			// Calculate the actual offset in the backing file
 			offset := faultPageAddr - region.BaseHostVirtAddr
 			backingFilePfn := (region.Offset + offset) / h.pageSize

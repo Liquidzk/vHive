@@ -32,3 +32,38 @@ func TestCoalesceWorkingSetCopiesRejectsUnalignedLength(t *testing.T) {
 		t.Fatalf("coalesced copies = %#v, want none", got)
 	}
 }
+
+func TestWorkingSetDestinationAcrossGuestRegions(t *testing.T) {
+	const (
+		page       = uint64(4096)
+		threeGiB   = uint64(3 * 1024 * 1024 * 1024)
+		oneGiB     = uint64(1024 * 1024 * 1024)
+		firstHost  = uint64(0x1000000000)
+		secondHost = uint64(0x2000000000)
+	)
+	regions := []GuestRegionUffdMapping{
+		{BaseHostVirtAddr: firstHost, Size: threeGiB, Offset: 0, PageSize: page},
+		{BaseHostVirtAddr: secondHost, Size: oneGiB, Offset: threeGiB, PageSize: page},
+	}
+
+	tests := []struct {
+		name string
+		pfn  uint64
+		want uint64
+		ok   bool
+	}{
+		{name: "first region", pfn: 7, want: firstHost + 7*page, ok: true},
+		{name: "second region start", pfn: threeGiB / page, want: secondHost, ok: true},
+		{name: "second region interior", pfn: threeGiB/page + 9, want: secondHost + 9*page, ok: true},
+		{name: "past guest memory", pfn: (threeGiB + oneGiB) / page, ok: false},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			got, ok := workingSetDestination(test.pfn, page, regions)
+			if ok != test.ok || got != test.want {
+				t.Fatalf("workingSetDestination(%d) = (%#x, %v), want (%#x, %v)", test.pfn, got, ok, test.want, test.ok)
+			}
+		})
+	}
+}
