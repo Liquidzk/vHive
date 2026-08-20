@@ -763,7 +763,7 @@ type SnapshotManager struct {
 	initWg  sync.WaitGroup
 }
 
-func (mgr *SnapshotManager) ConfigurePlanB(codecName string, maxHardwareJobs uint8) error {
+func (mgr *SnapshotManager) ConfigurePlanB(codecName string, maxHardwareJobs uint8, partitionCount uint32) error {
 	if !planb.Available() {
 		return planb.ErrUnavailable
 	}
@@ -774,9 +774,16 @@ func (mgr *SnapshotManager) ConfigurePlanB(codecName string, maxHardwareJobs uin
 	if maxHardwareJobs == 0 {
 		maxHardwareJobs = 1
 	}
-	mgr.planBOptions = planb.Options{Codec: codec, MaxHardwareJobs: maxHardwareJobs}
+	if partitionCount == 0 {
+		return errors.New("Plan B partition count must be at least one")
+	}
+	mgr.planBOptions = planb.Options{
+		Codec:           codec,
+		MaxHardwareJobs: maxHardwareJobs,
+		PartitionCount:  partitionCount,
+	}
 	mgr.planBEnabled = true
-	log.Infof("Plan B private working-set codec enabled: codec=%s jobs=%d", codec, maxHardwareJobs)
+	log.Infof("Plan B private working-set codec enabled: codec=%s partitions=%d jobs=%d", codec, partitionCount, maxHardwareJobs)
 	return nil
 }
 

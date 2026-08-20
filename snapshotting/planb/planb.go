@@ -54,6 +54,7 @@ func (c Codec) String() string {
 type Options struct {
 	Codec           Codec
 	MaxHardwareJobs uint8
+	PartitionCount  uint32
 	StaticHuffman   bool
 }
 
@@ -80,6 +81,12 @@ func Open(path string, opts Options) (*Restorer, error) {
 	if path == "" {
 		return nil, errors.New("Plan B snapshot path is empty")
 	}
+	if opts.MaxHardwareJobs == 0 {
+		opts.MaxHardwareJobs = 1
+	}
+	if opts.PartitionCount == 0 {
+		opts.PartitionCount = 1
+	}
 	impl, err := openImpl(path, opts)
 	if err != nil {
 		return nil, err
@@ -89,8 +96,9 @@ func Open(path string, opts Options) (*Restorer, error) {
 	return r, nil
 }
 
-// Compress writes one compact stream. Guest PFNs remain in SnapShare's
-// separate private index; only the packed private bytes enter this codec.
+// Compress writes one or more independently decodable streams. Guest PFNs
+// remain in SnapShare's separate private index; only the packed private bytes
+// and their page-aligned codec partitions enter this layer.
 func (r *Restorer) Compress(content []byte) error {
 	if r == nil || r.impl == nil {
 		return errors.New("Plan B restorer is closed")

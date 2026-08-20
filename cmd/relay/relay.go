@@ -312,6 +312,7 @@ func main() {
 	isWSRecording := flag.Bool("wsRecording", false, "Enable recording of working set pages accessed during function execution")
 	planBPrivateWS := flag.Bool("planBPrivateWS", false, "Compress and restore the private working set through the optional Plan B codec")
 	planBCodec := flag.String("planBCodec", "iaa_deflate", "Plan B codec: iaa_deflate, sw_deflate, zstd_1, or zstd_3")
+	planBPartitions := flag.Uint("planBPartitions", 1, "Number of independently compressed Plan B working-set partitions")
 	planBJobs := flag.Uint("planBJobs", 1, "Maximum concurrent IAA jobs for the Plan B codec")
 	hostIface := flag.String("hostIface", "", "Host net-interface for the VMs to bind to for internet access")
 	netPoolSize := flag.Int("netPoolSize", 10, "Amount of network configs to preallocate in a pool")
@@ -335,6 +336,9 @@ func main() {
 	}
 	if *planBJobs == 0 || *planBJobs > uint(^uint8(0)) {
 		log.Fatalf("planBJobs must be between 1 and %d", uint(^uint8(0)))
+	}
+	if *planBPartitions == 0 || uint64(*planBPartitions) > uint64(^uint32(0)) {
+		log.Fatalf("planBPartitions must be between 1 and %d", uint64(^uint32(0)))
 	}
 	if *planBPrivateWS && (!*isUPFEnabled || !*isLazyMode || !*isWSEnabled || !*isWSCoalescing) {
 		log.Fatal("planBPrivateWS requires -upf -lazy -ws -wsCoalescing")
@@ -416,7 +420,7 @@ func main() {
 	// defer orch.Cleanup()
 	snapMgr = orch.GetSnapshotManager()
 	if *planBPrivateWS {
-		if err := snapMgr.ConfigurePlanB(*planBCodec, uint8(*planBJobs)); err != nil {
+		if err := snapMgr.ConfigurePlanB(*planBCodec, uint8(*planBJobs), uint32(*planBPartitions)); err != nil {
 			log.Fatalf("failed to enable Plan B private working set: %v", err)
 		}
 	}
