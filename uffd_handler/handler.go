@@ -323,11 +323,17 @@ func (po *PageOperations) insertWorkingSet(uffd int, regions []GuestRegionUffdMa
 	sourceCopies := make([]workingSetCopy, 0, len(po.workingSet))
 	fallbackPages := make([]fallbackPage, 0, len(po.workingSet))
 	seen := make(map[uint64]struct{}, len(po.workingSet))
-	for i, pfn := range po.workingSet {
+	legacyContentIndex := 0
+	for _, pfn := range po.workingSet {
 		if _, ok := seen[pfn]; ok {
 			continue
 		}
 		seen[pfn] = struct{}{}
+		// UploadWorkingSet writes one monolithic content page per unique PFN.
+		// Keep this index independent of the raw CSV row so duplicate PFNs do
+		// not shift every subsequent page in the legacy content buffer.
+		contentIndex := legacyContentIndex
+		legacyContentIndex++
 		dst, ok := workingSetDestination(pfn, po.pageSize, regions)
 		if !ok {
 			continue
@@ -339,7 +345,7 @@ func (po *PageOperations) insertWorkingSet(uffd int, regions []GuestRegionUffdMa
 				len: po.pageSize,
 			})
 		} else {
-			fallbackPages = append(fallbackPages, fallbackPage{idx: i, pfn: pfn, dst: dst})
+			fallbackPages = append(fallbackPages, fallbackPage{idx: contentIndex, pfn: pfn, dst: dst})
 		}
 	}
 	sourceCopies = coalesceWorkingSetCopies(sourceCopies, po.pageSize)
