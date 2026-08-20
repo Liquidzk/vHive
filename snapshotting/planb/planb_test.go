@@ -8,6 +8,7 @@ func TestParseCodec(t *testing.T) {
 		"iaa_deflate": CodecIAADeflate,
 		"zstd_1":      CodecZstd1,
 		"zstd_3":      CodecZstd3,
+		"gzip":        CodecGzip,
 	} {
 		got, err := ParseCodec(name)
 		if err != nil || got != want || got.String() != name {
@@ -25,5 +26,11 @@ func TestStubAvailabilityMatchesBuild(t *testing.T) {
 	}
 	if _, err := Open(t.TempDir()+"/ws", Options{}); err == nil {
 		t.Fatal("stub Open unexpectedly succeeded")
+	}
+}
+
+func TestGzipRejectsMultiplePartitions(t *testing.T) {
+	if _, err := Open(t.TempDir()+"/ws", Options{Codec: CodecGzip, PartitionCount: 2}); err == nil {
+		t.Fatal("gzip unexpectedly accepted multiple partitions")
 	}
 }

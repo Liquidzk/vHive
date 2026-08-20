@@ -49,6 +49,10 @@ func TestSoftwareFourPartitionRoundTrip(t *testing.T) {
 	})
 }
 
+func TestGzipRoundTrip(t *testing.T) {
+	testRoundTrip(t, CodecGzip)
+}
+
 func TestIAARoundTrip(t *testing.T) {
 	if os.Geteuid() != 0 {
 		t.Skip("IAA work queue requires root")

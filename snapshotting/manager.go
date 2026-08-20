@@ -777,6 +777,9 @@ func (mgr *SnapshotManager) ConfigurePlanB(codecName string, maxHardwareJobs uin
 	if partitionCount == 0 {
 		return errors.New("Plan B partition count must be at least one")
 	}
+	if codec == planb.CodecGzip && partitionCount != 1 {
+		return errors.New("gzip Plan B supports exactly one partition")
+	}
 	mgr.planBOptions = planb.Options{
 		Codec:           codec,
 		MaxHardwareJobs: maxHardwareJobs,

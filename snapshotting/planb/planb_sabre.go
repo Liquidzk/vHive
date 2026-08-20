@@ -25,6 +25,9 @@ type sabreRestorer struct {
 func Available() bool { return true }
 
 func openImpl(path string, opts Options) (restorerImpl, error) {
+	if opts.Codec == CodecGzip {
+		return openGzipImpl(path)
+	}
 	cPath := C.CString(path)
 	defer C.free(unsafe.Pointer(cPath))
 	codec, err := codecToC(opts.Codec)

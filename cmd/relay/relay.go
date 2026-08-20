@@ -311,7 +311,7 @@ func main() {
 	isWSCoalescing := flag.Bool("wsCoalescing", false, "Enable coalescing of working set pulls for multiple UPF-enabled VMs")
 	isWSRecording := flag.Bool("wsRecording", false, "Enable recording of working set pages accessed during function execution")
 	planBPrivateWS := flag.Bool("planBPrivateWS", false, "Compress and restore the private working set through the optional Plan B codec")
-	planBCodec := flag.String("planBCodec", "iaa_deflate", "Plan B codec: iaa_deflate, sw_deflate, zstd_1, or zstd_3")
+	planBCodec := flag.String("planBCodec", "iaa_deflate", "Plan B codec: iaa_deflate, sw_deflate, gzip, zstd_1, or zstd_3")
 	planBPartitions := flag.Uint("planBPartitions", 1, "Number of independently compressed Plan B working-set partitions")
 	planBJobs := flag.Uint("planBJobs", 1, "Maximum concurrent IAA jobs for the Plan B codec")
 	hostIface := flag.String("hostIface", "", "Host net-interface for the VMs to bind to for internet access")

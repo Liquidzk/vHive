@@ -19,6 +19,7 @@ const (
 	CodecIAADeflate
 	CodecZstd1
 	CodecZstd3
+	CodecGzip
 )
 
 func ParseCodec(value string) (Codec, error) {
@@ -31,6 +32,8 @@ func ParseCodec(value string) (Codec, error) {
 		return CodecZstd1, nil
 	case "zstd_3":
 		return CodecZstd3, nil
+	case "gzip":
+		return CodecGzip, nil
 	default:
 		return 0, fmt.Errorf("unsupported Plan B codec %q", value)
 	}
@@ -46,6 +49,8 @@ func (c Codec) String() string {
 		return "zstd_1"
 	case CodecZstd3:
 		return "zstd_3"
+	case CodecGzip:
+		return "gzip"
 	default:
 		return fmt.Sprintf("unknown_%d", c)
 	}
@@ -86,6 +91,9 @@ func Open(path string, opts Options) (*Restorer, error) {
 	}
 	if opts.PartitionCount == 0 {
 		opts.PartitionCount = 1
+	}
+	if opts.Codec == CodecGzip && opts.PartitionCount != 1 {
+		return nil, fmt.Errorf("gzip Plan B supports exactly one partition, got %d", opts.PartitionCount)
 	}
 	impl, err := openImpl(path, opts)
 	if err != nil {
