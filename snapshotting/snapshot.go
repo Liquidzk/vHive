@@ -102,6 +102,18 @@ func (snp *Snapshot) GetWSContentFilePath() string {
 	return filepath.Join(snp.snapDir, "working_set_pages_content")
 }
 
+func (snp *Snapshot) GetWSPlanBBasePath() string {
+	return snp.GetWSContentFilePath() + ".planb"
+}
+
+func (snp *Snapshot) GetWSPlanBSnapshotPath() string {
+	return snp.GetWSPlanBBasePath() + ".snapshot"
+}
+
+func (snp *Snapshot) GetWSPlanBPartitionsPath() string {
+	return snp.GetWSPlanBBasePath() + ".partitions"
+}
+
 func (snp *Snapshot) GetWSPrivateContentFilePath() string {
 	return filepath.Join(snp.snapDir, "working_set_pages_content_private")
 }

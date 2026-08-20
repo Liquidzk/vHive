@@ -756,6 +756,7 @@ type SnapshotManager struct {
 	wsWarnOnce    sync.Once
 	wsPersistLock sync.Map // image name -> *sync.Mutex
 	planBEnabled  bool
+	planBFullWS   bool
 	planBOptions  planb.Options
 
 	// Used to store remote snapshots
@@ -764,6 +765,14 @@ type SnapshotManager struct {
 }
 
 func (mgr *SnapshotManager) ConfigurePlanB(codecName string, maxHardwareJobs uint8, partitionCount uint32) error {
+	return mgr.configurePlanB(codecName, maxHardwareJobs, partitionCount, false)
+}
+
+func (mgr *SnapshotManager) ConfigurePlanBFullWS(codecName string, maxHardwareJobs uint8, partitionCount uint32) error {
+	return mgr.configurePlanB(codecName, maxHardwareJobs, partitionCount, true)
+}
+
+func (mgr *SnapshotManager) configurePlanB(codecName string, maxHardwareJobs uint8, partitionCount uint32, fullWS bool) error {
 	if !planb.Available() {
 		return planb.ErrUnavailable
 	}
@@ -786,7 +795,12 @@ func (mgr *SnapshotManager) ConfigurePlanB(codecName string, maxHardwareJobs uin
 		PartitionCount:  partitionCount,
 	}
 	mgr.planBEnabled = true
-	log.Infof("Plan B private working-set codec enabled: codec=%s partitions=%d jobs=%d", codec, partitionCount, maxHardwareJobs)
+	mgr.planBFullWS = fullWS
+	if fullWS {
+		log.Infof("Plan B full working-set codec enabled: codec=%s partitions=%d jobs=%d", codec, partitionCount, maxHardwareJobs)
+	} else {
+		log.Infof("Plan B private working-set codec enabled: codec=%s partitions=%d jobs=%d", codec, partitionCount, maxHardwareJobs)
+	}
 	return nil
 }
 
@@ -1512,6 +1526,24 @@ func (mgr *SnapshotManager) UploadWorkingSet(revision string) error {
 			if err := mgr.uploadFile(revision, contentPath); err != nil {
 				return errors.Wrapf(err, "uploading monolithic working set content file")
 			}
+			if mgr.planBEnabled && mgr.planBFullWS {
+				if err := contentFile.Sync(); err != nil {
+					return errors.Wrapf(err, "syncing monolithic working set content file")
+				}
+				content, readErr := os.ReadFile(contentPath)
+				if readErr != nil {
+					return errors.Wrapf(readErr, "reading monolithic working set for Plan B")
+				}
+				if err := mgr.encodePlanBWorkingSet(snap.GetWSPlanBBasePath(), revision, "full", content); err != nil {
+					return errors.Wrapf(err, "encoding Plan B full working set")
+				}
+				if err := mgr.uploadFile(revision, snap.GetWSPlanBSnapshotPath()); err != nil {
+					return errors.Wrapf(err, "uploading Plan B full working-set payload")
+				}
+				if err := mgr.uploadFile(revision, snap.GetWSPlanBPartitionsPath()); err != nil {
+					return errors.Wrapf(err, "uploading Plan B full working-set partition table")
+				}
+			}
 			_ = mgr.wsRegistry.AddAccess(revision)
 
 			return nil
@@ -1626,7 +1658,7 @@ func (mgr *SnapshotManager) UploadWorkingSet(revision string) error {
 		if err := mgr.uploadFile(revision, snap.GetWSPrivateIndexFilePath()); err != nil {
 			return errors.Wrapf(err, "uploading private working set index file")
 		}
-		if mgr.planBEnabled && len(privateBuild.content) > 0 {
+		if mgr.planBEnabled && !mgr.planBFullWS && len(privateBuild.content) > 0 {
 			if err := mgr.encodePlanBPrivateWorkingSet(snap, privateBuild.content); err != nil {
 				return errors.Wrapf(err, "encoding Plan B private working set")
 			}
@@ -1727,9 +1759,12 @@ func sortPrivateWorkingSet(pfns []uint64, content []byte) ([]uint64, []byte, err
 }
 
 func (mgr *SnapshotManager) encodePlanBPrivateWorkingSet(snap *Snapshot, content []byte) error {
-	basePath := snap.GetWSPrivatePlanBBasePath()
-	_ = os.Remove(snap.GetWSPrivatePlanBSnapshotPath())
-	_ = os.Remove(snap.GetWSPrivatePlanBPartitionsPath())
+	return mgr.encodePlanBWorkingSet(snap.GetWSPrivatePlanBBasePath(), snap.GetId(), "private", content)
+}
+
+func (mgr *SnapshotManager) encodePlanBWorkingSet(basePath, revision, scope string, content []byte) error {
+	_ = os.Remove(basePath + ".snapshot")
+	_ = os.Remove(basePath + ".partitions")
 	restorer, err := planb.Open(basePath, mgr.planBOptions)
 	if err != nil {
 		return err
@@ -1739,13 +1774,18 @@ func (mgr *SnapshotManager) encodePlanBPrivateWorkingSet(snap *Snapshot, content
 	if err := restorer.Compress(content); err != nil {
 		return err
 	}
-	payloadInfo, _ := os.Stat(snap.GetWSPrivatePlanBSnapshotPath())
+	payloadInfo, _ := os.Stat(basePath + ".snapshot")
 	payloadBytes := int64(0)
 	if payloadInfo != nil {
 		payloadBytes = payloadInfo.Size()
 	}
-	log.Infof("Plan B private WS compressed: revision=%s codec=%s input_bytes=%d payload_bytes=%d elapsed=%v",
-		snap.GetId(), mgr.planBOptions.Codec, len(content), payloadBytes, time.Since(start))
+	if scope == "private" {
+		log.Infof("Plan B private WS compressed: revision=%s codec=%s input_bytes=%d payload_bytes=%d elapsed=%v",
+			revision, mgr.planBOptions.Codec, len(content), payloadBytes, time.Since(start))
+	} else {
+		log.Infof("Plan B full WS compressed: revision=%s codec=%s input_bytes=%d payload_bytes=%d elapsed=%v",
+			revision, mgr.planBOptions.Codec, len(content), payloadBytes, time.Since(start))
+	}
 	return nil
 }
 
@@ -2862,6 +2902,13 @@ func (mgr *SnapshotManager) GetUffdMemoryContentManaged(snap *Snapshot, lazy boo
 
 func (mgr *SnapshotManager) GetWorkingSetContentManaged(snap *Snapshot) ([]byte, func(), error) {
 	if mgr.securityMode == "full" {
+		if mgr.planBEnabled && mgr.planBFullWS {
+			content, releaseFn, err := mgr.getPlanBFullContent(snap)
+			if err == nil {
+				return content, releaseFn, nil
+			}
+			log.Warnf("Plan B full WS unavailable for revision %s, falling back to raw content: %v", snap.GetId(), err)
+		}
 		return mgr.GetSnapshotFileContentManaged(snap, snap.GetWSContentFilePath())
 	}
 
@@ -2878,28 +2925,34 @@ func (mgr *SnapshotManager) GetWorkingSetContentManaged(snap *Snapshot) ([]byte,
 	return nil, combineReleaseFuncs(releaseFn, fallbackRelease), fallbackErr
 }
 
-func privateWorkingSetSize(index []byte) (uint64, error) {
+func packedWorkingSetSize(index []byte) (uint64, error) {
 	records, err := csv.NewReader(bytes.NewReader(index)).ReadAll()
 	if err != nil {
 		return 0, err
 	}
 	if len(records) == 0 || len(records[0]) == 0 || records[0][0] != "pfn" {
-		return 0, errors.New("private working-set index must start with a pfn header")
+		return 0, errors.New("working-set index must start with a pfn header")
 	}
-	pages := uint64(0)
+	seen := make(map[uint64]struct{}, len(records)-1)
 	for _, record := range records[1:] {
 		if len(record) == 0 || record[0] == "" {
 			continue
 		}
-		if _, err := strconv.ParseUint(record[0], 10, 64); err != nil {
+		pfn, err := strconv.ParseUint(record[0], 10, 64)
+		if err != nil {
 			return 0, err
 		}
-		pages++
+		seen[pfn] = struct{}{}
 	}
+	pages := uint64(len(seen))
 	if pages == 0 || pages > ^uint64(0)/4096 {
-		return 0, errors.New("private working-set index has no valid pages or is too large")
+		return 0, errors.New("working-set index has no valid pages or is too large")
 	}
 	return pages * 4096, nil
+}
+
+func privateWorkingSetSize(index []byte) (uint64, error) {
+	return packedWorkingSetSize(index)
 }
 
 func persistPlanBFile(path string, content []byte) error {
@@ -2947,16 +3000,16 @@ func (mgr *SnapshotManager) ensurePlanBFile(snap *Snapshot, path string) (func()
 	return release, nil
 }
 
-func (mgr *SnapshotManager) getPlanBPrivateContent(snap *Snapshot, index []byte) ([]byte, func(), error) {
-	expectedBytes, err := privateWorkingSetSize(index)
+func (mgr *SnapshotManager) getPlanBContent(snap *Snapshot, basePath string, index []byte, scope string) ([]byte, func(), error) {
+	expectedBytes, err := packedWorkingSetSize(index)
 	if err != nil {
 		return nil, func() {}, err
 	}
-	payloadRelease, err := mgr.ensurePlanBFile(snap, snap.GetWSPrivatePlanBSnapshotPath())
+	payloadRelease, err := mgr.ensurePlanBFile(snap, basePath+".snapshot")
 	if err != nil {
 		return nil, payloadRelease, err
 	}
-	partitionsRelease, err := mgr.ensurePlanBFile(snap, snap.GetWSPrivatePlanBPartitionsPath())
+	partitionsRelease, err := mgr.ensurePlanBFile(snap, basePath+".partitions")
 	if err != nil {
 		payloadRelease()
 		return nil, partitionsRelease, err
@@ -2964,7 +3017,7 @@ func (mgr *SnapshotManager) getPlanBPrivateContent(snap *Snapshot, index []byte)
 	defer payloadRelease()
 	defer partitionsRelease()
 
-	restorer, err := planb.Open(snap.GetWSPrivatePlanBBasePath(), mgr.planBOptions)
+	restorer, err := planb.Open(basePath, mgr.planBOptions)
 	if err != nil {
 		return nil, func() {}, err
 	}
@@ -2975,9 +3028,29 @@ func (mgr *SnapshotManager) getPlanBPrivateContent(snap *Snapshot, index []byte)
 		return nil, func() {}, err
 	}
 	metrics := restorer.Metrics()
-	log.Infof("Plan B private WS decompressed: revision=%s codec=%s bytes=%d decompress_us=%d total_us=%d elapsed=%v",
-		snap.GetId(), mgr.planBOptions.Codec, expectedBytes, metrics.Decompress, metrics.MemRestoreTotal, time.Since(start))
+	if scope == "private" {
+		log.Infof("Plan B private WS decompressed: revision=%s codec=%s bytes=%d decompress_us=%d total_us=%d elapsed=%v",
+			snap.GetId(), mgr.planBOptions.Codec, expectedBytes, metrics.Decompress, metrics.MemRestoreTotal, time.Since(start))
+	} else {
+		log.Infof("Plan B full WS decompressed: revision=%s codec=%s bytes=%d decompress_us=%d total_us=%d elapsed=%v",
+			snap.GetId(), mgr.planBOptions.Codec, expectedBytes, metrics.Decompress, metrics.MemRestoreTotal, time.Since(start))
+	}
 	return region.Bytes(), region.Free, nil
+}
+
+func (mgr *SnapshotManager) getPlanBPrivateContent(snap *Snapshot, index []byte) ([]byte, func(), error) {
+	return mgr.getPlanBContent(snap, snap.GetWSPrivatePlanBBasePath(), index, "private")
+}
+
+func (mgr *SnapshotManager) getPlanBFullContent(snap *Snapshot) ([]byte, func(), error) {
+	index, indexRelease, err := mgr.GetWorkingSetPagesManaged(snap)
+	if err != nil {
+		return nil, indexRelease, err
+	}
+	if indexRelease != nil {
+		defer indexRelease()
+	}
+	return mgr.getPlanBContent(snap, snap.GetWSPlanBBasePath(), index, "full")
 }
 
 func (mgr *SnapshotManager) GetWorkingSetContentSourcesManaged(snap *Snapshot) (*WorkingSetContentSources, func(), error) {
@@ -2993,7 +3066,7 @@ func (mgr *SnapshotManager) GetWorkingSetContentSourcesManaged(snap *Snapshot) (
 
 	var privateContent []byte
 	privateContentRelease := func() {}
-	if mgr.planBEnabled && len(privateIndex) > 0 {
+	if mgr.planBEnabled && !mgr.planBFullWS && len(privateIndex) > 0 {
 		privateContent, privateContentRelease, err = mgr.getPlanBPrivateContent(snap, privateIndex)
 		if err != nil {
 			log.Warnf("Plan B private WS unavailable for revision %s, falling back to raw content: %v", snap.GetId(), err)
@@ -3163,7 +3236,11 @@ func (mgr *SnapshotManager) isWorkingSetCacheFile(localPath string) bool {
 	name := filepath.Base(localPath)
 	return name == "working_set_pages" ||
 		name == "working_set_pages_content" ||
+		name == "working_set_pages_content.planb.snapshot" ||
+		name == "working_set_pages_content.planb.partitions" ||
 		name == "working_set_pages_content_private" ||
+		name == "working_set_pages_content_private.planb.snapshot" ||
+		name == "working_set_pages_content_private.planb.partitions" ||
 		name == "working_set_pages_index_private"
 }
 
@@ -3186,7 +3263,11 @@ func (mgr *SnapshotManager) getWorkingSetSizeInChunks(revision string) uint64 {
 	files := []string{
 		"working_set_pages",
 		"working_set_pages_content",
+		"working_set_pages_content.planb.snapshot",
+		"working_set_pages_content.planb.partitions",
 		"working_set_pages_content_private",
+		"working_set_pages_content_private.planb.snapshot",
+		"working_set_pages_content_private.planb.partitions",
 		"working_set_pages_index_private",
 	}
 
@@ -3215,7 +3296,11 @@ func (mgr *SnapshotManager) removeWorkingSetFiles(revision string) error {
 	files := []string{
 		"working_set_pages",
 		"working_set_pages_content",
+		"working_set_pages_content.planb.snapshot",
+		"working_set_pages_content.planb.partitions",
 		"working_set_pages_content_private",
+		"working_set_pages_content_private.planb.snapshot",
+		"working_set_pages_content_private.planb.partitions",
 		"working_set_pages_index_private",
 	}
 

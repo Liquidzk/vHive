@@ -39,3 +39,13 @@ func TestPrivateWorkingSetSize(t *testing.T) {
 		t.Fatalf("private working-set size = %d", size)
 	}
 }
+
+func TestPackedWorkingSetSizeDeduplicatesAndAcceptsRecorderColumns(t *testing.T) {
+	size, err := packedWorkingSetSize([]byte("pfn,timestamp\n5,10\n2,20\n5,30\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if size != 2*4096 {
+		t.Fatalf("packed working-set size = %d", size)
+	}
+}

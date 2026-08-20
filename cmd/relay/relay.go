@@ -311,6 +311,7 @@ func main() {
 	isWSCoalescing := flag.Bool("wsCoalescing", false, "Enable coalescing of working set pulls for multiple UPF-enabled VMs")
 	isWSRecording := flag.Bool("wsRecording", false, "Enable recording of working set pages accessed during function execution")
 	planBPrivateWS := flag.Bool("planBPrivateWS", false, "Compress and restore the private working set through the optional Plan B codec")
+	planBFullWS := flag.Bool("planBFullWS", false, "Compress and restore the complete working set through the optional Plan B codec")
 	planBCodec := flag.String("planBCodec", "iaa_deflate", "Plan B codec: iaa_deflate, sw_deflate, gzip, zstd_1, or zstd_3")
 	planBPartitions := flag.Uint("planBPartitions", 1, "Number of independently compressed Plan B working-set partitions")
 	planBJobs := flag.Uint("planBJobs", 1, "Maximum concurrent IAA jobs for the Plan B codec")
@@ -340,8 +341,14 @@ func main() {
 	if *planBPartitions == 0 || uint64(*planBPartitions) > uint64(^uint32(0)) {
 		log.Fatalf("planBPartitions must be between 1 and %d", uint64(^uint32(0)))
 	}
-	if *planBPrivateWS && (!*isUPFEnabled || !*isLazyMode || !*isWSEnabled || !*isWSCoalescing) {
-		log.Fatal("planBPrivateWS requires -upf -lazy -ws -wsCoalescing")
+	if *planBPrivateWS && *planBFullWS {
+		log.Fatal("planBPrivateWS and planBFullWS are mutually exclusive")
+	}
+	if (*planBPrivateWS || *planBFullWS) && (!*isUPFEnabled || !*isLazyMode || !*isWSEnabled || !*isWSCoalescing) {
+		log.Fatal("Plan B working-set codecs require -upf -lazy -ws -wsCoalescing")
+	}
+	if *planBFullWS && strings.ToLower(*security) != "full" {
+		log.Fatal("planBFullWS requires -security full")
 	}
 
 	imageMap = make(map[string]string)
@@ -422,6 +429,10 @@ func main() {
 	if *planBPrivateWS {
 		if err := snapMgr.ConfigurePlanB(*planBCodec, uint8(*planBJobs), uint32(*planBPartitions)); err != nil {
 			log.Fatalf("failed to enable Plan B private working set: %v", err)
+		}
+	} else if *planBFullWS {
+		if err := snapMgr.ConfigurePlanBFullWS(*planBCodec, uint8(*planBJobs), uint32(*planBPartitions)); err != nil {
+			log.Fatalf("failed to enable Plan B full working set: %v", err)
 		}
 	}
 	time.Sleep(1 * time.Second) // Wait for orchestrator to fully initialize
