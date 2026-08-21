@@ -16,6 +16,9 @@ package; they are intentionally not committed to Git.
 - `restore_node.sh` performs explicit, gated recovery stages from the local
   package. It refuses to overwrite existing MinIO, MongoDB, result, or Sabre
   state.
+- `validate_handoff.sh` verifies every checksum, archive stream, Git bundle,
+  script, and required hardware/provenance count before the source node is
+  released.
 - `smoke_aes_restore.sh` validates a restored AES-Go IAA snapshot after the
   runtime is started.
 - `fast-restore.cloud-init.yaml` installs only the inexpensive preflight
@@ -38,6 +41,10 @@ MONGO_PRIVATE_IP=10.0.0.11 ./restore_node.sh restore-mongodb
 HOST_IFACE=bond0.3 ./restore_node.sh start
 ./smoke_aes_restore.sh
 ```
+
+`restore-eval` installs the curated result mirror directly. On a fresh target,
+`restore-eval-full` may be used instead to unpack every remote diagnostic cache
+and raw log from the larger archive.
 
 `MONGO_PRIVATE_IP` and `HOST_IFACE` must be adapted to the replacement node.
 The restored MinIO and MongoDB credentials are evaluation-only defaults and

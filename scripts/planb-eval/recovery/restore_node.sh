@@ -116,8 +116,14 @@ install_artifacts() {
 
 restore_eval() {
   [[ ! -e $eval_dir/results ]] || die "$eval_dir/results already exists"
+  cp -a --reflink=auto "$archive_dir/eval/snapshare-eval-mirror/." "$eval_dir/"
+  echo "EVAL_RESTORE=PASS mode=curated root=$eval_dir"
+}
+
+restore_eval_full() {
+  [[ ! -e $eval_dir/results ]] || die "$eval_dir/results already exists"
   tar --zstd -xf "$archive_dir/packages/snapshare-fourfn-eval.tar.zst" -C "$HOME"
-  echo "EVAL_RESTORE=PASS root=$eval_dir"
+  echo "EVAL_RESTORE=PASS mode=full-remote root=$eval_dir"
 }
 
 restore_original_sabre() {
@@ -315,6 +321,7 @@ case ${1:-} in
   verify) verify_archive ;;
   install) install_artifacts ;;
   restore-eval) restore_eval ;;
+  restore-eval-full) restore_eval_full ;;
   restore-sabre) restore_original_sabre ;;
   configure-iaa) configure_iaa ;;
   configure-cpu) configure_cpu ;;
@@ -324,7 +331,7 @@ case ${1:-} in
   start) start_services ;;
   status) status ;;
   *)
-    echo "usage: $0 {verify|install|restore-eval|restore-sabre|configure-iaa|configure-cpu|import-minio|restore-mongodb|create-devmapper|start|status}" >&2
+    echo "usage: $0 {verify|install|restore-eval|restore-eval-full|restore-sabre|configure-iaa|configure-cpu|import-minio|restore-mongodb|create-devmapper|start|status}" >&2
     exit 2
     ;;
 esac
