@@ -5,12 +5,16 @@ grpcurl=${GRPCURL:-${HOME}/vswarm/tools/bin/grpcurl}
 proto_root=${PROTO_ROOT:-${HOME}/vswarm/utils/protobuf/helloworld}
 endpoint=${RELAY_ENDPOINT:-127.0.0.1:18080}
 image=${AES_IMAGE:-ghcr.io/leokondrashov/aes-go@sha256:50a670defc33dbbece7837c991999d9e118fa1e16bd10f9c8f06a07ecf078f07}
-revision=${REVISION:-planb-aes-go-private-iaa-deflate-20260821-fixed4g-iaa-wq8-matrix-r1-aes-p1j1-a-b}
+revision=${REVISION:-}
 value=${AES_INPUT:-snapshare-aes-target}
 timeout_s=${CALL_TIMEOUT:-300}
 
 [[ -x $grpcurl ]] || { echo "missing grpcurl: $grpcurl" >&2; exit 2; }
 [[ -f $proto_root/helloworld.proto ]] || { echo "missing protobuf tree: $proto_root" >&2; exit 2; }
+[[ -n $revision ]] || {
+  echo "set REVISION to a snapshot generated on this replacement node" >&2
+  exit 2
+}
 
 relay_args="--addr=0.0.0.0:50000 --function-endpoint-url=0.0.0.0 --function-endpoint-port=50051 --function-name=aes-go --value=$value --fail-on-error-reply"
 start_ns=$(date +%s%N)

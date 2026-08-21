@@ -5,6 +5,7 @@ archive_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 repo_dir=${VHIVE_DIR:-${HOME}/vhive-snapshare}
 vswarm_dir=${VSWARM_DIR:-${HOME}/vswarm}
 eval_dir=${EVAL_DIR:-${HOME}/snapshare-fourfn-eval}
+sabre_dir=${SABRE_DIR:-${HOME}/original-sabre}
 minio_user=${MINIO_USER:-minio}
 minio_password=${MINIO_PASSWORD:-minio123}
 required_vhive_base=2dda717cb1bcb955dbe6a986449abf09efea8421
@@ -116,23 +117,22 @@ install_artifacts() {
 
 restore_eval() {
   [[ ! -e $eval_dir/results ]] || die "$eval_dir/results already exists"
-  cp -a --reflink=auto "$archive_dir/eval/snapshare-eval-mirror/." "$eval_dir/"
-  echo "EVAL_RESTORE=PASS mode=curated root=$eval_dir"
-}
-
-restore_eval_full() {
-  [[ ! -e $eval_dir/results ]] || die "$eval_dir/results already exists"
-  tar --zstd -xf "$archive_dir/packages/snapshare-fourfn-eval.tar.zst" -C "$HOME"
-  echo "EVAL_RESTORE=PASS mode=full-remote root=$eval_dir"
+  cp -a --reflink=auto "$archive_dir/eval/snapshare-eval-portable/." "$eval_dir/"
+  tar --zstd -xf \
+    "$archive_dir/packages/remote-single-node-results-essential.tar.zst" \
+    -C "$eval_dir"
+  echo "EVAL_RESTORE=PASS mode=portable-results root=$eval_dir"
 }
 
 restore_original_sabre() {
-  command -v docker >/dev/null || die "run install first"
-  [[ ! -e /opt/sabre/.git ]] || die "/opt/sabre already exists"
-  zstd -dc "$archive_dir/images/original-sabre-docker-images.tar.zst" \
-    | sudo docker load
-  sudo tar --zstd -xf "$archive_dir/packages/original-sabre-opt.tar.zst" -C /opt
-  echo ORIGINAL_SABRE_RESTORE=PASS
+  [[ ! -e $sabre_dir ]] || die "$sabre_dir already exists"
+  git clone --recurse-submodules https://github.com/barabanshek/sabre.git "$sabre_dir"
+  git -C "$sabre_dir" checkout 474034c76e315b73b96bab6c9e2f6531581bd940
+  git -C "$sabre_dir" submodule update --init --recursive
+  install -m 0644 \
+    "$archive_dir/source/original-sabre-untracked/firecracker-build.rs" \
+    "$sabre_dir/firecracker/build.rs"
+  echo "ORIGINAL_SABRE_RESTORE=PASS root=$sabre_dir"
 }
 
 configure_iaa() {
@@ -165,20 +165,11 @@ configure_cpu() {
   sudo "$eval_dir/configure_cpu_baseline.sh" status
 }
 
-import_minio() {
+start_minio() {
   command -v docker >/dev/null || die "run install first"
   if sudo docker container inspect snapshare-minio >/dev/null 2>&1; then
     die "container snapshare-minio already exists; inspect it instead of overwriting"
   fi
-  local import_root=${MINIO_IMPORT_DIR:-${HOME}/iaa-handoff-import}
-  mkdir -p "$import_root"
-  if [[ ! -f $import_root/.minio-extract-complete ]]; then
-    [[ ! -e $import_root/minio-snapshots ]] || \
-      die "partial MinIO extraction exists at $import_root/minio-snapshots"
-    tar --zstd -xf "$archive_dir/packages/minio-snapshots.tar.zst" -C "$import_root"
-    touch "$import_root/.minio-extract-complete"
-  fi
-
   sudo install -d -m 0755 /var/lib/snapshare-minio
   sudo docker run -d --name snapshare-minio --restart unless-stopped \
     --network host \
@@ -194,22 +185,16 @@ import_minio() {
   done
   curl --fail --silent http://127.0.0.1:9000/minio/health/ready >/dev/null || \
     die "MinIO did not become ready"
-
   sudo docker run --rm --network host \
-    --user "$(id -u):$(id -g)" \
     -e MC_CONFIG_DIR=/tmp/mc \
     -e MINIO_USER="$minio_user" \
     -e MINIO_PASSWORD="$minio_password" \
-    -v "$import_root/minio-snapshots:/import:ro" \
     --entrypoint /bin/sh minio/mc:RELEASE.2025-08-13T08-35-41Z -c '
       set -eu
       mc alias set dst http://127.0.0.1:9000 "$MINIO_USER" "$MINIO_PASSWORD" >/dev/null
       mc mb --ignore-existing dst/snapshots >/dev/null
-      mc mirror --overwrite /import dst/snapshots
-      mc stat dst/snapshots/planb-aes-go-private-iaa-deflate-20260821-fixed4g-iaa-wq8-diagonal16-r1-aes-p16j16/recipe_file >/dev/null
-      mc stat dst/snapshots/planb-video-processing-python-4k-ab-iaa-deflate-20260821-fixed4g-iaa-wq8-diagonal16-r1-fourfn-p16j16/recipe_file >/dev/null
     '
-  echo MINIO_IMPORT=PASS
+  echo MINIO_START=PASS
 }
 
 restore_mongodb() {
@@ -252,7 +237,7 @@ start_services() {
   [[ -d $repo_dir/.git ]] || die "run install first"
   [[ -d ${HOME}/images ]] || die "function provenance images are missing"
   sudo dmsetup info fc-dev-thinpool >/dev/null 2>&1 || die "run create-devmapper first"
-  sudo docker container inspect snapshare-minio >/dev/null 2>&1 || die "run import-minio first"
+  sudo docker container inspect snapshare-minio >/dev/null 2>&1 || die "run start-minio first"
   sudo docker container inspect snapshare-mongodb >/dev/null 2>&1 || die "run restore-mongodb first"
   [[ $(find /dev/iax -maxdepth 1 -type c -name 'wq*' 2>/dev/null | wc -l) -eq 32 ]] || \
     die "run configure-iaa first"
@@ -324,17 +309,16 @@ case ${1:-} in
   verify) verify_archive ;;
   install) install_artifacts ;;
   restore-eval) restore_eval ;;
-  restore-eval-full) restore_eval_full ;;
   restore-sabre) restore_original_sabre ;;
   configure-iaa) configure_iaa ;;
   configure-cpu) configure_cpu ;;
-  import-minio) import_minio ;;
+  start-minio) start_minio ;;
   restore-mongodb) restore_mongodb ;;
   create-devmapper) create_devmapper ;;
   start) start_services ;;
   status) status ;;
   *)
-    echo "usage: $0 {verify|install|restore-eval|restore-eval-full|restore-sabre|configure-iaa|configure-cpu|import-minio|restore-mongodb|create-devmapper|start|status}" >&2
+    echo "usage: $0 {verify|install|restore-eval|restore-sabre|configure-iaa|configure-cpu|start-minio|restore-mongodb|create-devmapper|start|status}" >&2
     exit 2
     ;;
 esac

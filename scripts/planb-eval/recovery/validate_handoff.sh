@@ -29,6 +29,10 @@ bash -n restore_node.sh smoke_aes_restore.sh scripts/*.sh validate_handoff.sh
 [[ $(wc -l < provenance/iaa-device-nodes.txt) -eq 32 ]]
 [[ $(grep -c '^policy' provenance/cpu-state.txt) -eq 24 ]]
 grep -q '^iaa_settings=1:1 2:2 4:4 8:8 16:16$' \
-  eval/snapshare-eval-mirror/results/sabre/20260821-fixed4g-iaa-wq8-diagonal16-r1/matrix.env
+  eval/snapshare-eval-portable/results/sabre/20260821-fixed4g-iaa-wq8-diagonal16-r1/matrix.env
+grep -q '^included_entries=9447$' \
+  provenance/remote-results-essential-inventory.txt
+grep -q '^excluded_rebuildable_files=1521$' \
+  provenance/remote-results-essential-inventory.txt
 
 echo HANDOFF_VALIDATION=PASS

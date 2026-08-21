@@ -1,18 +1,19 @@
 # Single-node IAA recovery helpers
 
 These scripts preserve the procedure used to capture and restore the
-2026-08-22 SnapShare Plan B evaluation node. Large runtime binaries, OCI
-images, MinIO objects, MongoDB data, experiment logs, and SHA-256 manifests are
+2026-08-22 SnapShare Plan B evaluation node. Runtime binaries, OCI images,
+MongoDB data, all essential experiment results/logs, and SHA-256 manifests are
 stored separately in the local `IAA单节点-保存/恢复/node-handoff-20260822`
-package; they are intentionally not committed to Git.
+package; they are intentionally not committed to Git. Regenerable MinIO
+objects, staged WS payloads, caches, and build directories are not retained.
 
 - `collect_node_provenance.sh` records hardware, CPU, IAA, runtime, package,
   container, and binary state without stopping services.
 - `export_minio_bucket.sh` exports the complete `snapshots` bucket through the
   S3 API. It does not copy MinIO's internal `xl.meta` representation.
-- `pack_remote_handoff.sh` packages the S3 export, exact source/build trees,
-  function provenance inputs, and raw experiment results as checked zstd
-  archives.
+- `pack_remote_handoff.sh` is the optional full forensic packer. The compact
+  release package keeps only its function-provenance/component outputs and a
+  separately filtered essential-results archive.
 - `restore_node.sh` performs explicit, gated recovery stages from the local
   package. It refuses to overwrite existing MinIO, MongoDB, result, or Sabre
   state.
@@ -35,16 +36,21 @@ README. The normal sequence on a fresh compatible node is:
 ./restore_node.sh restore-sabre
 ./restore_node.sh configure-iaa
 ./restore_node.sh configure-cpu
-./restore_node.sh import-minio
+./restore_node.sh start-minio
 MONGO_PRIVATE_IP=10.0.0.11 ./restore_node.sh restore-mongodb
 ./restore_node.sh create-devmapper
 HOST_IFACE=bond0.3 ./restore_node.sh start
-./smoke_aes_restore.sh
 ```
 
-`restore-eval` installs the curated result mirror directly. On a fresh target,
-`restore-eval-full` may be used instead to unpack every remote diagnostic cache
-and raw log from the larger archive.
+`restore-eval` installs the portable local result tree and overlays the
+essential result/log archive collected from the remote node. Large staged
+working-set payloads, generated snapshot caches, MinIO objects, and build
+directories are deliberately regenerated rather than copied.
+
+After regenerating an AES snapshot on the replacement node, validate it with
+`REVISION=<new-revision> ./smoke_aes_restore.sh`. The helper deliberately has
+no default revision because the old MinIO objects are not part of this compact
+handoff.
 
 `MONGO_PRIVATE_IP` and `HOST_IFACE` must be adapted to the replacement node.
 The restored MinIO and MongoDB credentials are evaluation-only defaults and
