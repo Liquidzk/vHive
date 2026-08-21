@@ -17,7 +17,8 @@ The runners target the single-node layout used by the evaluation and expect:
 
 - an IAA-enabled host with QPL, Sabre's `MemoryRestorator`, KVM, containerd,
   Firecracker, the demux snapshotter, and the HTTP resolver;
-- eight enabled IAA work queues;
+- eight enabled IAA work queues for the original fixed-CPU matrix, or 32
+  enabled queues for the 8-WQ/device topology rerun;
 - MinIO container `snapshare-minio` at `127.0.0.1:9000` and MongoDB at
   `10.0.0.11:27017`;
 - vSwarm's `grpcurl` and protobuf tree under `/home/ubuntu/vswarm`;
@@ -101,3 +102,33 @@ snapshot cache, waits for Firecracker and vSwarm relay ports to become idle,
 and restores the baseline relay on exit. A valid default run ends with 800
 correct calls, 40 variants, 80 path-specific groups, zero failures, and zero
 fallbacks.
+
+## 8-WQ/device diagonal sweep
+
+`run_fixed4g_iaa_wq8_matrix.sh` reuses the same fixed-CPU workload runners but
+expects 32 enabled IAA work queues (four devices with eight shared queues per
+device). The setting list is explicit and may be changed without editing the
+runner. The validated five-point invocation is:
+
+```bash
+export STAMP=$(date +%Y%m%d-%H%M%S)-fixed4g-iaa-wq8
+IAA_SETTINGS="1:1 2:2 4:4 8:8 16:16" \
+PREFLIGHT_ONLY=1 \
+  /home/ubuntu/snapshare-fourfn-eval/run_fixed4g_iaa_wq8_matrix.sh
+
+tmux new-session -d -s "$STAMP" \
+  "STAMP=$STAMP IAA_SETTINGS='1:1 2:2 4:4 8:8 16:16' \
+   /home/ubuntu/snapshare-fourfn-eval/run_fixed4g_iaa_wq8_matrix.sh"
+```
+
+Each `P:J` pair means `P` independently encoded Private-WS partitions and at
+most `J` concurrent IAA jobs. The launcher validates that both values are
+positive, that `J <= P`, and that no pair is repeated. The completed five-point
+dataset has 500 calls, 25 variants, and 50 path-specific summary groups.
+
+`summarize_iaa_wq8_matrix.py` assembles the child runs and
+`summarize_iaa_wq8_results.py` produces the 25 matched remote/local points.
+The two `compare_iaa_wq_*` scripts compare queue topologies and per-restore
+sample distributions. `EXPECTED_IAA_WQ_COUNT` is propagated to the underlying
+AES-Go and video-processing runners so their preflight matches the selected
+topology rather than silently assuming eight total queues.

@@ -84,15 +84,17 @@ smt_active=$(cat /sys/devices/system/cpu/smt/active 2>/dev/null || echo unavaila
 no_turbo=$(cat /sys/devices/system/cpu/intel_pstate/no_turbo 2>/dev/null || echo unavailable)
 hwp_dynamic_boost=$(cat /sys/devices/system/cpu/intel_pstate/hwp_dynamic_boost 2>/dev/null || echo unavailable)
 queue_count=$(find /dev/iax -maxdepth 1 -type c -name 'wq*' 2>/dev/null | wc -l)
+expected_iaa_wq_count=${EXPECTED_IAA_WQ_COUNT:-8}
 mongo_ready=0
 if timeout 3 bash -c '</dev/tcp/10.0.0.11/27017' 2>/dev/null; then
   mongo_ready=1
 fi
 [[ $active_policy_count -eq 24 && $governor_bad -eq 0 && $epp_bad -eq 0 \
   && $min_freq_bad -eq 0 && $max_freq_bad -eq 0 && $smt_active == 0 \
-  && $no_turbo == 0 && $hwp_dynamic_boost == 0 && $queue_count -eq 8 \
+  && $no_turbo == 0 && $hwp_dynamic_boost == 0 \
+  && $queue_count -eq $expected_iaa_wq_count \
   && $mongo_ready -eq 1 ]] || {
-  echo "preflight failed: active_policies=$active_policy_count governor_bad=$governor_bad epp_bad=$epp_bad min_freq_bad=$min_freq_bad max_freq_bad=$max_freq_bad smt_active=$smt_active no_turbo=$no_turbo hwp_dynamic_boost=$hwp_dynamic_boost iaa_work_queues=$queue_count mongo_ready=$mongo_ready" >&2
+  echo "preflight failed: active_policies=$active_policy_count governor_bad=$governor_bad epp_bad=$epp_bad min_freq_bad=$min_freq_bad max_freq_bad=$max_freq_bad smt_active=$smt_active no_turbo=$no_turbo hwp_dynamic_boost=$hwp_dynamic_boost iaa_work_queues=$queue_count expected_iaa_work_queues=$expected_iaa_wq_count mongo_ready=$mongo_ready" >&2
   exit 2
 }
 if [[ ${PREFLIGHT_ONLY:-0} == 1 ]]; then
@@ -118,6 +120,7 @@ outer_log=$result_root/launcher.log
   echo "intel_pstate_no_turbo=$no_turbo"
   echo "intel_pstate_hwp_dynamic_boost=$hwp_dynamic_boost"
   echo "iaa_work_queues=$queue_count"
+  echo "expected_iaa_work_queues=$expected_iaa_wq_count"
   echo "mongo_ready=$mongo_ready"
   uname -a
   lscpu
