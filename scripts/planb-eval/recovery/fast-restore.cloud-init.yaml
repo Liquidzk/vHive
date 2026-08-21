@@ -1,0 +1,53 @@
+#cloud-config
+# Fast preflight for a fresh Ubuntu 24.04 IAA node. This intentionally does
+# not configure work queues, huge pages, devmapper, MinIO or the relay; those
+# stateful steps are handled by node-handoff-20260822/restore_node.sh after the
+# archive has been copied to the node.
+
+package_update: true
+packages:
+  - accel-config
+  - bc
+  - ca-certificates
+  - curl
+  - docker.io
+  - git
+  - iproute2
+  - iptables
+  - jq
+  - libgflags-dev
+  - liblz4-dev
+  - libzstd-dev
+  - thin-provisioning-tools
+  - tmux
+
+write_files:
+  - path: /usr/local/sbin/iaa-fast-preflight
+    owner: root:root
+    permissions: "0755"
+    content: |
+      #!/usr/bin/env bash
+      set -uo pipefail
+      modprobe idxd 2>/dev/null || true
+      modprobe kvm_intel 2>/dev/null || true
+      count=0
+      for device_file in /sys/bus/pci/devices/*/device; do
+        [[ -r "${device_file}" ]] || continue
+        [[ "$(<"${device_file}")" == "0x0cfe" ]] && count=$((count + 1))
+      done
+      echo "IAA_PCI_COUNT=${count}"
+      [[ -c /dev/kvm ]] && echo "KVM=present" || echo "KVM=missing"
+      find /sys/bus/dsa/devices -maxdepth 1 -type l -printf '%f\n' 2>/dev/null | sort || true
+      if ((count == 0)) || [[ ! -c /dev/kvm ]]; then
+        echo "HARDWARE_GATE=FAIL"
+        exit 20
+      fi
+      echo "HARDWARE_GATE=PASS"
+
+runcmd:
+  - [systemctl, enable, --now, docker]
+  - [bash, -lc, "/usr/local/sbin/iaa-fast-preflight | tee /var/log/iaa-fast-preflight.log"]
+
+final_message: >-
+  IAA fast preflight finished in $UPTIME seconds. Check
+  /var/log/iaa-fast-preflight.log before copying the saved handoff archive.

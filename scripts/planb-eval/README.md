@@ -132,3 +132,7 @@ The two `compare_iaa_wq_*` scripts compare queue topologies and per-restore
 sample distributions. `EXPECTED_IAA_WQ_COUNT` is propagated to the underlying
 AES-Go and video-processing runners so their preflight matches the selected
 topology rather than silently assuming eight total queues.
+
+The capture and staged restore helpers for the corresponding single-node IAA
+environment are documented in [`recovery/`](recovery/). Large data-plane
+artifacts remain in the separately checksummed local handoff package.
