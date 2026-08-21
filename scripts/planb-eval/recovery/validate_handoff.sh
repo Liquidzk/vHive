@@ -4,10 +4,10 @@ set -euo pipefail
 root=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 cd "$root"
 
-sha256sum -c SHA256SUMS
-(cd packages && sha256sum -c SHA256SUMS)
-(cd images && sha256sum -c SHA256SUMS)
-(cd mongodb && sha256sum -c SHA256SUMS)
+sha256sum --quiet -c SHA256SUMS
+(cd packages && sha256sum --quiet -c SHA256SUMS)
+(cd images && sha256sum --quiet -c SHA256SUMS)
+(cd mongodb && sha256sum --quiet -c SHA256SUMS)
 
 for archive in packages/*.tar.zst; do
   zstd -q -t "$archive"
@@ -20,8 +20,13 @@ done
 tar -tf images/firecracker-eval-images.oci.tar >/dev/null
 gzip -t mongodb/snapshare-mongodb.archive.gz
 
-git bundle verify source/Liquidzk-vHive-snapshare-sabre-buffered.bundle
-git bundle verify source/Liquidzk-vSwarm-snapshare-eval-images.bundle
+bundle_repo=$(mktemp -d)
+trap 'rm -rf -- "$bundle_repo"' EXIT
+git -C "$bundle_repo" init -q
+git -C "$bundle_repo" bundle verify \
+  "$root/source/Liquidzk-vHive-snapshare-sabre-buffered.bundle"
+git -C "$bundle_repo" bundle verify \
+  "$root/source/Liquidzk-vSwarm-snapshare-eval-images.bundle"
 
 bash -n restore_node.sh smoke_aes_restore.sh scripts/*.sh validate_handoff.sh
 
