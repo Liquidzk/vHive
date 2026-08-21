@@ -42,8 +42,9 @@ MONGO_PRIVATE_IP=10.0.0.11 ./restore_node.sh restore-mongodb
 HOST_IFACE=bond0.3 ./restore_node.sh start
 ```
 
-`restore-eval` installs the portable local result tree and overlays the
-essential result/log archive collected from the remote node. Large staged
+`restore-eval` installs the portable local result tree, overlays the
+essential result/log archive collected from the remote node, and restores the
+earlier `sabre-results` plus runtime logs. Large staged
 working-set payloads, generated snapshot caches, MinIO objects, and build
 directories are deliberately regenerated rather than copied.
 

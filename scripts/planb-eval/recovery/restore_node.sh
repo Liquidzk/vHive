@@ -121,7 +121,10 @@ restore_eval() {
   tar --zstd -xf \
     "$archive_dir/packages/remote-single-node-results-essential.tar.zst" \
     -C "$eval_dir"
-  echo "EVAL_RESTORE=PASS mode=portable-results root=$eval_dir"
+  tar --zstd -xf \
+    "$archive_dir/packages/remote-sabre-results-essential.tar.zst" \
+    -C "$HOME"
+  echo "EVAL_RESTORE=PASS mode=portable-results root=$eval_dir sabre_results=${HOME}/sabre-results"
 }
 
 restore_original_sabre() {
