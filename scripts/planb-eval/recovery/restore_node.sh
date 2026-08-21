@@ -127,7 +127,10 @@ restore_eval_full() {
 }
 
 restore_original_sabre() {
+  command -v docker >/dev/null || die "run install first"
   [[ ! -e /opt/sabre/.git ]] || die "/opt/sabre already exists"
+  zstd -dc "$archive_dir/images/original-sabre-docker-images.tar.zst" \
+    | sudo docker load
   sudo tar --zstd -xf "$archive_dir/packages/original-sabre-opt.tar.zst" -C /opt
   echo ORIGINAL_SABRE_RESTORE=PASS
 }
