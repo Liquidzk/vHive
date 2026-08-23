@@ -317,13 +317,18 @@ func main() {
 	cacheSize := flag.Uint64("cacheSize", 15000, "Size of the cache for memory file chunks when chunking is enabled")
 	cleaning = flag.Bool("clean", false, "Clean existing snapshots after each invocation")
 	dropCaches = flag.Bool("dropCaches", false, "Drop Linux page caches after each invocation teardown")
-	security := flag.String("security", "none", "Snapshot security mode: none, full")
+	security := flag.String("security", snapshotting.SecurityModeNone,
+		"Snapshot security mode: none, partial, no-image-sharing, full")
 	baseSnap = flag.Bool("baseSnap", false, "Use base snapshot of booted VM for snapshot creation")
 	threads := flag.Int("j", 8, "How many concurrent uploads/downloads to run when transferring snapshots")
 	encryption := flag.Bool("encryption", false, "Enable snapshot encryption")
 	flag.Parse()
 	if *vmMemSizeMib == 0 || uint64(*vmMemSizeMib) > uint64(^uint32(0)) {
 		log.Fatalf("vmMemSizeMib must be between 1 and %d", uint64(^uint32(0)))
+	}
+	*security = snapshotting.NormalizeSecurityMode(*security)
+	if !snapshotting.IsValidSecurityMode(*security) {
+		log.Fatalf("invalid snapshot security mode %q; expected one of: none, partial, no-image-sharing, full", *security)
 	}
 
 	imageMap = make(map[string]string)

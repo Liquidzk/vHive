@@ -107,7 +107,8 @@ func main() {
 	minioAccessKey := flag.String("minioAccessKey", "minio", "MinIO Access Key")
 	minioSecretKey := flag.String("minioSecretKey", "minio123", "MinIO Secret Key")
 	bucketName := flag.String("bucket", "snapshots", "MinIO bucket name")
-	targetMode := flag.String("mode", "none", "Target security mode (full, partial, none)")
+	targetMode := flag.String("mode", snapshotting.SecurityModeNone,
+		"Target security mode (full, partial, no-image-sharing, none)")
 	encryption := flag.Bool("encryption", false, "Use encryption")
 	baseDir := flag.String("baseDir", "/tmp", "Base directory containing images folder")
 	wsCoalescing := flag.Bool("wsCoalescing", false, "Enable WS coalescing")
@@ -131,9 +132,9 @@ func main() {
 		log.Fatalf("Failed to initialize storage: %v", err)
 	}
 
-	*targetMode = strings.ToLower(strings.TrimSpace(*targetMode))
-	if *targetMode != "full" && *targetMode != "partial" && *targetMode != "none" {
-		log.Fatalf("Invalid mode %q. Expected one of: full, partial, none", *targetMode)
+	*targetMode = snapshotting.NormalizeSecurityMode(*targetMode)
+	if !snapshotting.IsValidSecurityMode(*targetMode) {
+		log.Fatalf("Invalid mode %q. Expected one of: full, partial, no-image-sharing, none", *targetMode)
 	}
 	if *chunkSize == 0 {
 		log.Fatalf("chunkSize must be greater than 0")

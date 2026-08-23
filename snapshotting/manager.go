@@ -58,11 +58,15 @@ import (
 )
 
 const (
-	chunkPrefix     = "_chunks"
-	wsSharedPrefix  = "ws_shared"
-	wsBaseRootfsKey = "base_rootfs"
-	K               = 3   // TODO: tune
-	deleteBatchSize = 150 // TODO: tune
+	chunkPrefix                = "_chunks"
+	wsSharedPrefix             = "ws_shared"
+	wsBaseRootfsKey            = "base_rootfs"
+	SecurityModeNone           = "none"
+	SecurityModePartial        = "partial"
+	SecurityModeNoImageSharing = "no-image-sharing"
+	SecurityModeFull           = "full"
+	K                          = 3   // TODO: tune
+	deleteBatchSize            = 150 // TODO: tune
 )
 
 var imageChunks = map[string]map[[16]byte]bool{}
@@ -70,6 +74,19 @@ var rootfsChunks = map[[16]byte]bool{}
 var baseSnapChunks = map[[16]byte]bool{}
 var EncryptionKey = []byte("vhive-snapshot-enc") // 16 bytes key for AES-128
 var wsCacheHTTPServerOnce sync.Once
+
+func NormalizeSecurityMode(mode string) string {
+	return strings.ToLower(strings.TrimSpace(mode))
+}
+
+func IsValidSecurityMode(mode string) bool {
+	switch NormalizeSecurityMode(mode) {
+	case SecurityModeNone, SecurityModePartial, SecurityModeNoImageSharing, SecurityModeFull:
+		return true
+	default:
+		return false
+	}
+}
 
 type WorkingSetContentSource struct {
 	Content []byte
@@ -820,7 +837,7 @@ func NewSnapshotManager(baseFolder string, store storage.ObjectStorage, chunking
 		wsRecording:   wsRecording,
 		lazy:          lazy,
 		cacheSize:     cacheSize,
-		securityMode:  strings.ToLower(securityMode),
+		securityMode:  NormalizeSecurityMode(securityMode),
 		threads:       threads,
 		encryption:    encryption,
 		cleanChunks:   cleanChunks,
@@ -845,7 +862,7 @@ func NewSnapshotManager(baseFolder string, store storage.ObjectStorage, chunking
 	manager.initWg.Add(1)
 	go func() {
 		defer manager.initWg.Done()
-		if !chunking || securityMode != "partial" {
+		if !chunking || !manager.usesProvenanceClassification() {
 			return
 		}
 
@@ -1416,7 +1433,7 @@ func (mgr *SnapshotManager) UploadWorkingSet(revision string) error {
 			return errors.Wrapf(err, "reading working set CSV")
 		}
 
-		if mgr.securityMode == "full" {
+		if mgr.securityMode == SecurityModeFull {
 			contentPath := snap.GetWSContentFilePath()
 			contentFile, err := os.Create(contentPath)
 			if err != nil {
@@ -1555,7 +1572,7 @@ func (mgr *SnapshotManager) UploadWorkingSet(revision string) error {
 
 			if mgr.isBaseRootfsChunk(hash) {
 				appendSharedPage(baseBuild, hash, pageCopy)
-			} else if mgr.isImageChunk(hash, imageName) {
+			} else if mgr.sharesImagePages() && mgr.isImageChunk(hash, imageName) {
 				appendSharedPage(imageBuild, hash, pageCopy)
 			} else {
 				appendPage(privateBuild, pfn, pageCopy)
@@ -1590,7 +1607,7 @@ func (mgr *SnapshotManager) UploadWorkingSet(revision string) error {
 			}
 		}
 
-		if len(imageBuild.hashes) > 0 && imageName != "" {
+		if mgr.sharesImagePages() && len(imageBuild.hashes) > 0 && imageName != "" {
 			imageIndex, idxErr := buildWSHashIndexCSV(imageBuild.hashes)
 			if idxErr != nil {
 				return errors.Wrapf(idxErr, "building image working set index")
@@ -1670,6 +1687,14 @@ func (mgr *SnapshotManager) isBaseRootfsChunk(hash [16]byte) bool {
 		return true
 	}
 	return false
+}
+
+func (mgr *SnapshotManager) usesProvenanceClassification() bool {
+	return mgr.securityMode == SecurityModePartial || mgr.securityMode == SecurityModeNoImageSharing
+}
+
+func (mgr *SnapshotManager) sharesImagePages() bool {
+	return mgr.securityMode == SecurityModePartial
 }
 
 func (mgr *SnapshotManager) isImageChunk(hash [16]byte, imageName string) bool {
@@ -1873,12 +1898,37 @@ func isHashSensitiveChunk(hash [16]byte, image string) bool {
 	return true
 }
 
+// isHashSensitiveNoImageSharing keeps only base snapshot and rootfs chunks
+// shareable. Image and function-private chunks receive revision-derived keys.
+func isHashSensitiveNoImageSharing(hash [16]byte, image string) bool {
+	if image == "" { // base snapshot creation
+		return false
+	}
+	if ok, _ := rootfsChunks[hash]; ok {
+		return false
+	}
+	if ok, _ := baseSnapChunks[hash]; ok {
+		return false
+	}
+	return true
+}
+
+func (mgr *SnapshotManager) isChunkSensitive(hash [16]byte, image string) bool {
+	switch mgr.securityMode {
+	case SecurityModeFull:
+		return true
+	case SecurityModePartial:
+		return isHashSensitiveChunk(hash, image)
+	case SecurityModeNoImageSharing:
+		return isHashSensitiveNoImageSharing(hash, image)
+	default:
+		return false
+	}
+}
+
 func (mgr *SnapshotManager) DeriveChunkHash(chunk []byte, revision, image string) [16]byte {
 	hash := md5.Sum(chunk)
-	if mgr.securityMode == "full" {
-		return md5.Sum(append(hash[:], []byte(revision)...))
-	}
-	if mgr.securityMode == "partial" && isHashSensitiveChunk(hash, image) {
+	if mgr.isChunkSensitive(hash, image) {
 		return md5.Sum(append(hash[:], []byte(revision)...))
 	}
 	return hash
@@ -2497,7 +2547,7 @@ func (mgr *SnapshotManager) downloadFile(revision, filePath, fileName string) er
 }
 
 func (mgr *SnapshotManager) GetWorkingSetContent(snap *Snapshot) ([]byte, error) {
-	if mgr.securityMode == "full" {
+	if mgr.securityMode == SecurityModeFull {
 		return mgr.GetSnapshotFileContent(snap, snap.GetWSContentFilePath())
 	}
 
@@ -2509,7 +2559,7 @@ func (mgr *SnapshotManager) GetWorkingSetContent(snap *Snapshot) ([]byte, error)
 }
 
 func (mgr *SnapshotManager) GetWorkingSetContentSources(snap *Snapshot) (*WorkingSetContentSources, error) {
-	if mgr.securityMode == "full" {
+	if mgr.securityMode == SecurityModeFull {
 		return nil, nil
 	}
 
@@ -2528,9 +2578,12 @@ func (mgr *SnapshotManager) GetWorkingSetContentSources(snap *Snapshot) (*Workin
 		return nil, err
 	}
 
-	imageSource, err := mgr.getSharedWSSource(normalizeImageName(snap.GetImage()))
-	if err != nil {
-		return nil, err
+	var imageSource *WorkingSetContentSource
+	if mgr.sharesImagePages() {
+		imageSource, err = mgr.getSharedWSSource(normalizeImageName(snap.GetImage()))
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	if len(privateContent) == 0 && len(privateIndex) == 0 && baseSource == nil && imageSource == nil {
@@ -2741,7 +2794,7 @@ func (mgr *SnapshotManager) GetUffdMemoryContentManaged(snap *Snapshot, lazy boo
 }
 
 func (mgr *SnapshotManager) GetWorkingSetContentManaged(snap *Snapshot) ([]byte, func(), error) {
-	if mgr.securityMode == "full" {
+	if mgr.securityMode == SecurityModeFull {
 		return mgr.GetSnapshotFileContentManaged(snap, snap.GetWSContentFilePath())
 	}
 
@@ -2759,7 +2812,7 @@ func (mgr *SnapshotManager) GetWorkingSetContentManaged(snap *Snapshot) ([]byte,
 }
 
 func (mgr *SnapshotManager) GetWorkingSetContentSourcesManaged(snap *Snapshot) (*WorkingSetContentSources, func(), error) {
-	if mgr.securityMode == "full" {
+	if mgr.securityMode == SecurityModeFull {
 		return nil, func() {}, nil
 	}
 
@@ -2781,10 +2834,13 @@ func (mgr *SnapshotManager) GetWorkingSetContentSourcesManaged(snap *Snapshot) (
 		return nil, func() {}, err
 	}
 
-	imageSource, err := mgr.getSharedWSSource(normalizeImageName(snap.GetImage()))
-	if err != nil {
-		combineReleaseFuncs(privateContentRelease, privateIndexRelease)()
-		return nil, func() {}, err
+	var imageSource *WorkingSetContentSource
+	if mgr.sharesImagePages() {
+		imageSource, err = mgr.getSharedWSSource(normalizeImageName(snap.GetImage()))
+		if err != nil {
+			combineReleaseFuncs(privateContentRelease, privateIndexRelease)()
+			return nil, func() {}, err
+		}
 	}
 
 	releaseFn := combineReleaseFuncs(privateContentRelease, privateIndexRelease)
@@ -3046,7 +3102,7 @@ func (mgr *SnapshotManager) getObjectKey(revision, fileName string) string {
 }
 
 func (mgr *SnapshotManager) IsChunkSensitive(hash [16]byte, image string) bool {
-	return isHashSensitiveChunk(hash, image)
+	return mgr.isChunkSensitive(hash, image)
 }
 
 // EnsureRemoteSnapshotChunked converts an existing remote snapshot to chunked format in-place.
@@ -3093,14 +3149,7 @@ func (mgr *SnapshotManager) rewriteRemoteRecipeForSecurityMode(revision, image s
 		var currentHash [md5.Size]byte
 		copy(currentHash[:], recipeData[i:i+md5.Size])
 
-		isSensitive := false
-		if mgr.securityMode == "full" {
-			isSensitive = true
-		} else if mgr.securityMode == "partial" {
-			isSensitive = mgr.IsChunkSensitive(currentHash, image)
-		}
-
-		if !isSensitive {
+		if !mgr.IsChunkSensitive(currentHash, image) {
 			continue
 		}
 
