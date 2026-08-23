@@ -459,7 +459,7 @@ func NewOrchestrator(snapshotter, hostIface string, opts ...OrchestratorOption) 
 			log.WithError(err).Fatalf("failed to create MinIO storage for snapshots in bucket %s", snapshotsBucket)
 		}
 	}
-	o.snapshotManager = snapshotting.NewSnapshotManager(o.snapshotsStorage, objectStore, o.isChunkingEnabled, false,
+	o.snapshotManager = snapshotting.NewSnapshotManager(o.snapshotsStorage, objectStore, o.isChunkingEnabled, o.cacheSnaps,
 		o.isLazyMode, o.isWSPulling, o.isWSCoalescing, o.isWSRecording, o.chunkSize, o.cacheSize, o.securityMode, o.threads, o.encryption, o.cleanChunks)
 
 	return o

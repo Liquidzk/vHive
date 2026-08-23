@@ -259,7 +259,11 @@ func (po *PageOperations) insertWorkingSet(uffd int, region *GuestRegionUffdMapp
 		count := ""
 		if po.baseRootfsSource != nil || po.imageSource != nil || po.privateSource != nil {
 			mode = "(Split WS) "
-			count = fmt.Sprintf(", private page count: %d", len(po.privateSource.pfnToIndex))
+			privatePageCount := 0
+			if po.privateSource != nil {
+				privatePageCount = len(po.privateSource.pfnToIndex)
+			}
+			count = fmt.Sprintf(", private page count: %d", privatePageCount)
 		} else if po.legacyWSContentPtr != 0 {
 			mode = "(Monolithic WS) "
 		} else if po.lazy {

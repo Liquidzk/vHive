@@ -850,17 +850,32 @@ func NewSnapshotManager(baseFolder string, store storage.ObjectStorage, chunking
 		}
 
 		imagesDir := filepath.Join(baseFolder, "..", "images")
-		entries, err := os.ReadDir(imagesDir)
-		if err != nil {
+		if _, err := os.Stat(imagesDir); err != nil {
 			log.Errorf("failed to read images directory: %v", err)
 			return
 		}
-		for _, entry := range entries {
-			if entry.IsDir() {
-				image := entry.Name()
-				imageChunks[image], _ = readTarChunkHashes(filepath.Join(imagesDir, image, "container.tar"), chunkSize)
-				log.Debugf("Found image directory: %s", image)
+		err := filepath.WalkDir(imagesDir, func(path string, entry os.DirEntry, walkErr error) error {
+			if walkErr != nil {
+				return walkErr
 			}
+			if entry.IsDir() || entry.Name() != "container.tar" {
+				return nil
+			}
+			imagePath, relErr := filepath.Rel(imagesDir, filepath.Dir(path))
+			if relErr != nil {
+				return relErr
+			}
+			image := normalizeImageName(filepath.ToSlash(imagePath))
+			hashes, readErr := readTarChunkHashes(path, chunkSize)
+			if readErr != nil {
+				return readErr
+			}
+			imageChunks[image] = hashes
+			log.Debugf("Found image directory: %s", image)
+			return nil
+		})
+		if err != nil {
+			log.Errorf("failed to load image chunk hashes: %v", err)
 		}
 		log.Infof("Loaded chunk hashes for %d images", len(imageChunks))
 
