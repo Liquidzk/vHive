@@ -63,6 +63,19 @@ func selectRevisionsForProcessing(revisions map[string]bool, allRevisions bool) 
 	return selected
 }
 
+// A lazy DownloadSnapshot deliberately skips the memory recipe because the
+// runtime normally fetches it later through GetUffdMemoryContent.  Conversion
+// is different: UploadWorkingSet immediately reconstructs WS pages from the
+// chunk recipe, so materialize that input synchronously before conversion.
+func materializeLazyRecipe(st storage.ObjectStorage, snap *snapshotting.Snapshot) error {
+	recipePath := snap.GetRecipeFilePath()
+	objectKey := filepath.Join(snap.GetId(), filepath.Base(recipePath))
+	if err := st.DownloadFile(objectKey, recipePath); err != nil {
+		return fmt.Errorf("materialize lazy recipe %s: %w", objectKey, err)
+	}
+	return nil
+}
+
 func listKnativeServices() ([]string, error) {
 	cmd := exec.Command("kubectl", "get", "ksvc", "-A", "-o", "json")
 	out, err := cmd.Output()
@@ -214,7 +227,7 @@ func main() {
 		parts := strings.Split(path, "/")
 		if len(parts) > 1 {
 			rev := parts[0]
-			if rev != "_chunks" && rev != "ws_shared" && rev != "" && rev != "base" {
+			if !strings.HasPrefix(rev, "_chunks") && rev != "ws_shared" && rev != "" && rev != "base" {
 				snapshots[rev] = true
 			}
 		}
@@ -243,11 +256,18 @@ func main() {
 			for snapID := range snapChan {
 				if err := mgr.EnsureRemoteSnapshotChunked(snapID); err != nil {
 					log.Errorf("Failed processing snapshot %s: %v", snapID, err)
+					continue
 				}
 				snap, err := mgr.DownloadSnapshot(snapID)
 				if err != nil {
 					log.Errorf("Failed downloading snapshot %s: %v", snapID, err)
 					continue
+				}
+				if *lazy {
+					if err := materializeLazyRecipe(st, snap); err != nil {
+						log.Errorf("Failed materializing lazy recipe for snapshot %s: %v", snapID, err)
+						continue
+					}
 				}
 				_, _ = mgr.GetWorkingSetPages(snap)
 				time.Sleep(100 * time.Millisecond)
@@ -268,6 +288,9 @@ func main() {
 	}
 	close(snapChan)
 	wg.Wait()
+	if len(processed) != len(selectedRevisions) {
+		log.Fatalf("Conversion incomplete: processed %d of %d selected snapshot revisions", len(processed), len(selectedRevisions))
+	}
 
 	if !*serviceFanOut {
 		log.Info("Knative service fan-out disabled")
