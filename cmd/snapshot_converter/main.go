@@ -142,6 +142,7 @@ func main() {
 	wsCoalescing := flag.Bool("wsCoalescing", false, "Enable WS coalescing")
 	wsCompression := flag.Bool("wsCompression", false, "Store coalesced private/full working sets as independently framed Zstd")
 	chunkCompression := flag.Bool("chunkCompression", false, "Store each converted snapshot chunk as an independent Zstd frame")
+	preserveRecipe := flag.Bool("preserveRecipe", false, "Preserve an existing chunk recipe while materializing the configured chunk representation")
 	zstdLevel := flag.Int("zstdLevel", snapshotting.DefaultZstdLevel, "Zstd compression level")
 	zstdFrameSize := flag.Int64("zstdFrameSize", snapshotting.DefaultZstdFrameSize, "Uncompressed bytes per independent WS Zstd frame")
 	zstdFetchers := flag.Int("zstdFetchers", snapshotting.DefaultZstdFetchers, "Maximum concurrent Zstd frame range GET/decode workers")
@@ -177,6 +178,9 @@ func main() {
 	}
 	if *wsCompression && !*wsCoalescing {
 		log.Fatal("-wsCompression requires -wsCoalescing")
+	}
+	if *preserveRecipe && !*chunkCompression {
+		log.Fatal("-preserveRecipe requires -chunkCompression")
 	}
 	if *chunkSize == 0 {
 		log.Fatalf("chunkSize must be greater than 0")
@@ -254,8 +258,14 @@ func main() {
 		go func() {
 			defer wg.Done()
 			for snapID := range snapChan {
-				if err := mgr.EnsureRemoteSnapshotChunked(snapID); err != nil {
-					log.Errorf("Failed processing snapshot %s: %v", snapID, err)
+				var ensureErr error
+				if *preserveRecipe {
+					ensureErr = mgr.EnsureRemoteSnapshotChunkRepresentation(snapID)
+				} else {
+					ensureErr = mgr.EnsureRemoteSnapshotChunked(snapID)
+				}
+				if ensureErr != nil {
+					log.Errorf("Failed processing snapshot %s: %v", snapID, ensureErr)
 					continue
 				}
 				snap, err := mgr.DownloadSnapshot(snapID)

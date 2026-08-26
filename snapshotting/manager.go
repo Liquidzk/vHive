@@ -3529,6 +3529,66 @@ func (mgr *SnapshotManager) EnsureRemoteSnapshotChunked(revision string) error {
 	return mgr.rewriteRemoteRecipeForSecurityMode(revision, tempSnap.Image, recipeData)
 }
 
+// EnsureRemoteSnapshotChunkRepresentation materializes the configured physical
+// representation for every chunk referenced by an already chunked snapshot
+// without changing the snapshot's recipe.  This is the matched-codec path: the
+// provenance policy and its derived chunk keys were fixed when the raw corpus
+// was created, so recomputing them here could salt private keys a second time
+// or reclassify image pages with a different image inventory.
+func (mgr *SnapshotManager) EnsureRemoteSnapshotChunkRepresentation(revision string) error {
+	if !mgr.chunking {
+		return errors.New("chunking must be enabled to convert remote snapshot chunks")
+	}
+	if mgr.storage == nil {
+		return errors.New("storage backend is not configured")
+	}
+	if !mgr.compression.Chunks {
+		return errors.New("chunk compression must be enabled to materialize a compressed representation")
+	}
+
+	recipeKey := mgr.getObjectKey(revision, "recipe_file")
+	recipeData, err := mgr.storage.DownloadObject(recipeKey)
+	if err != nil {
+		return errors.Wrapf(err, "downloading recipe_file for %s", revision)
+	}
+	if len(recipeData)%md5.Size != 0 {
+		return fmt.Errorf("recipe_file for %s has invalid length %d", revision, len(recipeData))
+	}
+
+	seen := make(map[string]struct{}, len(recipeData)/md5.Size)
+	for offset := 0; offset < len(recipeData); offset += md5.Size {
+		hash := hex.EncodeToString(recipeData[offset : offset+md5.Size])
+		if _, ok := seen[hash]; ok {
+			continue
+		}
+		seen[hash] = struct{}{}
+
+		compressedKey := mgr.getObjectKey(mgr.activeChunkPrefix(), hash)
+		exists, existsErr := mgr.storage.Exists(compressedKey)
+		if existsErr != nil {
+			return errors.Wrapf(existsErr, "checking compressed chunk %s", hash)
+		}
+		if exists {
+			continue
+		}
+
+		rawKey := mgr.getObjectKey(chunkPrefix, hash)
+		raw, downloadErr := mgr.storage.DownloadObject(rawKey)
+		if downloadErr != nil {
+			return errors.Wrapf(downloadErr, "downloading recipe-referenced raw chunk %s", hash)
+		}
+		stored, encodeErr := mgr.encodeChunkRepresentation(raw)
+		if encodeErr != nil {
+			return errors.Wrapf(encodeErr, "compressing recipe-referenced chunk %s", hash)
+		}
+		if uploadErr := mgr.storage.UploadObject(compressedKey, bytes.NewReader(stored), int64(len(stored))); uploadErr != nil {
+			return errors.Wrapf(uploadErr, "uploading compressed chunk %s", hash)
+		}
+	}
+
+	return nil
+}
+
 func (mgr *SnapshotManager) rewriteRemoteRecipeForSecurityMode(revision, image string, recipeData []byte) error {
 	newRecipe := make([]byte, len(recipeData))
 	copy(newRecipe, recipeData)

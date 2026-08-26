@@ -201,6 +201,50 @@ func TestConverterCreatesCompressedObjectsWithoutChangingRawRecipe(t *testing.T)
 	require.False(t, recipeUploaded, "physical recompression must not rewrite an unchanged provenance recipe")
 }
 
+func TestPreservedRecipeChunkConversionDoesNotResaltPartialKeys(t *testing.T) {
+	store := newMemoryRangeStorage()
+	raw := bytes.Repeat([]byte("private-partial-page"), 256)
+	raw = raw[:4096]
+	rawHash := md5.Sum(raw)
+	revision := "partial-revision"
+	saltedHash := md5.Sum(append(rawHash[:], []byte(revision)...))
+	saltedHashString := hex.EncodeToString(saltedHash[:])
+	store.put(chunkPrefix+"/"+saltedHashString[:2]+"/"+saltedHashString, raw)
+	store.put(revision+"/recipe_file", saltedHash[:])
+
+	mgr := NewSnapshotManager(t.TempDir(), store, true, false, true, false, false, false,
+		4096, 1024*1024, SecurityModePartial, 2, false, true)
+	require.NoError(t, mgr.ConfigureCompression(CompressionConfig{
+		Chunks: true, Codec: CompressionCodecZstd, Level: 3, FrameSize: 64 * 1024, Fetchers: 2,
+	}))
+	require.NoError(t, mgr.EnsureRemoteSnapshotChunkRepresentation(revision))
+
+	recipe, ok := store.get(revision + "/recipe_file")
+	require.True(t, ok)
+	require.Equal(t, saltedHash[:], recipe, "matched codec conversion must preserve provenance-derived keys")
+	stored, ok := store.get(mgr.getObjectKey(mgr.activeChunkPrefix(), saltedHashString))
+	require.True(t, ok)
+	decoded, err := mgr.decodeChunkRepresentation(stored)
+	require.NoError(t, err)
+	require.Equal(t, raw, decoded)
+
+	doubleSalted := md5.Sum(append(saltedHash[:], []byte(revision)...))
+	doubleSaltedString := hex.EncodeToString(doubleSalted[:])
+	_, exists := store.get(mgr.getObjectKey(mgr.activeChunkPrefix(), doubleSaltedString))
+	require.False(t, exists, "private key must not be salted a second time")
+}
+
+func TestPreservedRecipeChunkConversionRejectsMalformedRecipe(t *testing.T) {
+	store := newMemoryRangeStorage()
+	store.put("bad-revision/recipe_file", []byte("not-a-whole-md5"))
+	mgr := NewSnapshotManager(t.TempDir(), store, true, false, true, false, false, false,
+		4096, 1024*1024, SecurityModePartial, 2, false, true)
+	require.NoError(t, mgr.ConfigureCompression(CompressionConfig{
+		Chunks: true, Codec: CompressionCodecZstd, Level: 3, FrameSize: 64 * 1024, Fetchers: 2,
+	}))
+	require.ErrorContains(t, mgr.EnsureRemoteSnapshotChunkRepresentation("bad-revision"), "invalid length")
+}
+
 type memoryRangeStorage struct {
 	mu         sync.Mutex
 	objects    map[string][]byte
