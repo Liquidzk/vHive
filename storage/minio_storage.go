@@ -24,6 +24,7 @@ package storage
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"sync"
 
@@ -70,6 +71,15 @@ func (m *MinioStorage) DownloadObject(objectKey string) ([]byte, error) {
 		objectKey,
 		minio.StatObjectOptions{},
 	)
+	if err != nil {
+		return nil, errors.Wrapf(err, "stat object %s", objectKey)
+	}
+	if stat.Size < 0 {
+		return nil, fmt.Errorf("object %s has negative size %d", objectKey, stat.Size)
+	}
+	if stat.Size == 0 {
+		return []byte{}, nil
+	}
 
 	data := make([]byte, stat.Size)
 
@@ -78,53 +88,66 @@ func (m *MinioStorage) DownloadObject(objectKey string) ([]byte, error) {
 		concurrency = 1
 	}
 
-	fail := false
-	wg := sync.WaitGroup{}
+	errCh := make(chan error, concurrency)
+	var wg sync.WaitGroup
 	for i := range concurrency {
 		wg.Add(1)
-		go func() {
+		go func(rangeIndex int) {
 			defer wg.Done()
 
-			start := int64(i) * (stat.Size / int64(concurrency))
+			start := int64(rangeIndex) * (stat.Size / int64(concurrency))
 			end := start + (stat.Size / int64(concurrency))
-			if i == concurrency-1 {
+			if rangeIndex == concurrency-1 {
 				end = stat.Size
 			}
-
-			opts := minio.GetObjectOptions{}
-			opts.SetRange(start, end-1)
-
-			obj, err := m.client.GetObject(
-				context.Background(),
-				m.bucketName,
-				objectKey,
-				opts,
-			)
+			obj, err := m.OpenObjectRange(context.Background(), objectKey, start, end-start)
 			if err != nil {
-				fail = true
+				errCh <- err
 				return
 			}
 			defer obj.Close()
 
-			n, err := obj.Read(data[start:end])
-			if err != nil && err != io.EOF || n != int(end-start) {
-				fail = true
+			if _, err := io.ReadFull(obj, data[start:end]); err != nil {
+				errCh <- errors.Wrapf(err, "read object %s range [%d,%d)", objectKey, start, end)
 				return
 			}
-		}()
+		}(i)
 	}
 
 	wg.Wait()
+	close(errCh)
+	for rangeErr := range errCh {
+		if rangeErr != nil {
+			return nil, rangeErr
+		}
+	}
+	return data, nil
+}
 
-	if fail {
-		return nil, errors.Wrapf(err, "getting object %s", objectKey)
+// OpenObjectRange opens one byte range without buffering it.  MinIO performs
+// the request as the returned reader is consumed, so a Zstandard decoder can
+// start producing output before the entire range has arrived.
+func (m *MinioStorage) OpenObjectRange(ctx context.Context, objectKey string, offset, length int64) (io.ReadCloser, error) {
+	if offset < 0 {
+		return nil, fmt.Errorf("object %s range has negative offset %d", objectKey, offset)
+	}
+	if length <= 0 {
+		return nil, fmt.Errorf("object %s range has non-positive length %d", objectKey, length)
+	}
+	end := offset + length - 1
+	if end < offset {
+		return nil, fmt.Errorf("object %s range overflows: offset=%d length=%d", objectKey, offset, length)
 	}
 
-	// data, err := io.ReadAll(obj)
-	// if err != nil {
-	// 	return nil, errors.Wrapf(err, "reading object %s", objectKey)
-	// }
-	return data, nil
+	opts := minio.GetObjectOptions{}
+	if err := opts.SetRange(offset, end); err != nil {
+		return nil, errors.Wrapf(err, "set object %s range [%d,%d]", objectKey, offset, end)
+	}
+	obj, err := m.client.GetObject(ctx, m.bucketName, objectKey, opts)
+	if err != nil {
+		return nil, errors.Wrapf(err, "open object %s range [%d,%d]", objectKey, offset, end)
+	}
+	return obj, nil
 }
 
 func (m *MinioStorage) Exists(objectKey string) (bool, error) {

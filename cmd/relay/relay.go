@@ -304,6 +304,11 @@ func main() {
 	isLazyMode := flag.Bool("lazy", false, "Enable lazy serving mode when UPFs are enabled")
 	isWSEnabled := flag.Bool("ws", false, "Enable working set pulling for UPFs in lazy mode")
 	isWSCoalescing := flag.Bool("wsCoalescing", false, "Enable coalescing of working set pulls for multiple UPF-enabled VMs")
+	isWSCompression := flag.Bool("wsCompression", false, "Store coalesced private/full working sets as independently framed Zstd")
+	isChunkCompression := flag.Bool("chunkCompression", false, "Store each snapshot chunk as an independent Zstd frame")
+	zstdLevel := flag.Int("zstdLevel", snapshotting.DefaultZstdLevel, "Zstd compression level")
+	zstdFrameSize := flag.Int64("zstdFrameSize", snapshotting.DefaultZstdFrameSize, "Uncompressed bytes per independent WS Zstd frame; must be 4-KiB aligned")
+	zstdFetchers := flag.Int("zstdFetchers", snapshotting.DefaultZstdFetchers, "Maximum concurrent Zstd frame range GET/decode workers")
 	isWSRecording := flag.Bool("wsRecording", false, "Enable recording of working set pages accessed during function execution")
 	hostIface := flag.String("hostIface", "", "Host net-interface for the VMs to bind to for internet access")
 	netPoolSize := flag.Int("netPoolSize", 10, "Amount of network configs to preallocate in a pool")
@@ -333,6 +338,12 @@ func main() {
 	}
 	if *security == snapshotting.SecurityModeFullDedup && *isWSCoalescing {
 		log.Fatal("full-dedup requires -wsCoalescing=false: coalesced private working-set objects are revision-scoped and would not implement full deduplication")
+	}
+	if *isWSCompression && !*isWSCoalescing {
+		log.Fatal("-wsCompression requires -wsCoalescing")
+	}
+	if *isChunkCompression && !*isChunkingEnabled {
+		log.Fatal("-chunkCompression requires -chunking")
 	}
 	guestDNS := make([]string, 0)
 	for _, candidate := range strings.Split(*dnsNameservers, ",") {
@@ -419,9 +430,19 @@ func main() {
 		ctriface.WithThreads(*threads),
 		ctriface.WithEncryption(*encryption),
 		ctriface.WithCleanChunks(*cleaning),
+		ctriface.WithCompression(snapshotting.CompressionConfig{
+			WorkingSet: *isWSCompression,
+			Chunks:     *isChunkCompression,
+			Codec:      snapshotting.CompressionCodecZstd,
+			Level:      *zstdLevel,
+			FrameSize:  *zstdFrameSize,
+			Fetchers:   *zstdFetchers,
+		}),
 	)
 	// defer orch.Cleanup()
 	snapMgr = orch.GetSnapshotManager()
+	log.Infof("SNAPSHARE_COMPRESSION_CONFIG ws=%t chunks=%t codec=zstd level=%d frame_size=%d fetchers=%d",
+		*isWSCompression, *isChunkCompression, *zstdLevel, *zstdFrameSize, *zstdFetchers)
 	time.Sleep(1 * time.Second) // Wait for orchestrator to fully initialize
 
 	if *baseSnap {

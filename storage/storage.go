@@ -22,7 +22,10 @@
 
 package storage
 
-import "io"
+import (
+	"context"
+	"io"
+)
 
 // ObjectStorage defines the interface for object storage operations
 type ObjectStorage interface {
@@ -43,4 +46,12 @@ type ObjectStorage interface {
 
 	// DownloadFile downloads an object to a file
 	DownloadFile(objectKey string, filePath string) error
+}
+
+// RangeObjectStorage is an optional extension for consumers that can process
+// an object incrementally.  Keeping it separate preserves compatibility with
+// existing ObjectStorage implementations while allowing independently framed
+// compressed payloads to overlap range GETs with decoding.
+type RangeObjectStorage interface {
+	OpenObjectRange(ctx context.Context, objectKey string, offset, length int64) (io.ReadCloser, error)
 }

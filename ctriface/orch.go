@@ -351,6 +351,7 @@ type Orchestrator struct {
 	memoryManager *manager.MemoryManager
 
 	securityMode string
+	compression  snapshotting.CompressionConfig
 }
 
 // NewOrchestrator Initializes a new orchestrator
@@ -370,6 +371,7 @@ func NewOrchestrator(snapshotter, hostIface string, opts ...OrchestratorOption) 
 	o.minioAccessKey = "minio"
 	o.minioSecretKey = "minio123"
 	o.vmMemSizeMib = 512
+	o.compression = snapshotting.DefaultCompressionConfig()
 
 	o.dns = getK8sDNS()
 
@@ -461,6 +463,9 @@ func NewOrchestrator(snapshotter, hostIface string, opts ...OrchestratorOption) 
 	}
 	o.snapshotManager = snapshotting.NewSnapshotManager(o.snapshotsStorage, objectStore, o.isChunkingEnabled, o.cacheSnaps,
 		o.isLazyMode, o.isWSPulling, o.isWSCoalescing, o.isWSRecording, o.chunkSize, o.cacheSize, o.securityMode, o.threads, o.encryption, o.cleanChunks)
+	if err := o.snapshotManager.ConfigureCompression(o.compression); err != nil {
+		log.WithError(err).Fatal("invalid snapshot compression configuration")
+	}
 
 	return o
 }

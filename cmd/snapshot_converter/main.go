@@ -127,6 +127,11 @@ func main() {
 	encryption := flag.Bool("encryption", false, "Use encryption")
 	baseDir := flag.String("baseDir", "/tmp", "Base directory containing images folder")
 	wsCoalescing := flag.Bool("wsCoalescing", false, "Enable WS coalescing")
+	wsCompression := flag.Bool("wsCompression", false, "Store coalesced private/full working sets as independently framed Zstd")
+	chunkCompression := flag.Bool("chunkCompression", false, "Store each converted snapshot chunk as an independent Zstd frame")
+	zstdLevel := flag.Int("zstdLevel", snapshotting.DefaultZstdLevel, "Zstd compression level")
+	zstdFrameSize := flag.Int64("zstdFrameSize", snapshotting.DefaultZstdFrameSize, "Uncompressed bytes per independent WS Zstd frame")
+	zstdFetchers := flag.Int("zstdFetchers", snapshotting.DefaultZstdFetchers, "Maximum concurrent Zstd frame range GET/decode workers")
 	wsRecording := flag.Bool("wsRecording", false, "Enable WS recording")
 	lazy := flag.Bool("lazy", false, "Skip reconstructing complete memory files while converting chunked snapshots")
 	chunkSize := flag.Uint64("chunkSize", 4096, "Chunk size for chunking")
@@ -157,6 +162,9 @@ func main() {
 	if *targetMode == snapshotting.SecurityModeFullDedup && *wsCoalescing {
 		log.Fatal("full-dedup requires -wsCoalescing=false: coalesced private working-set objects are revision-scoped and would not implement full deduplication")
 	}
+	if *wsCompression && !*wsCoalescing {
+		log.Fatal("-wsCompression requires -wsCoalescing")
+	}
 	if *chunkSize == 0 {
 		log.Fatalf("chunkSize must be greater than 0")
 	}
@@ -167,6 +175,18 @@ func main() {
 	// Initialize SnapshotManager to load chunk info
 	smBase := filepath.Join(*baseDir, "snapshots")
 	mgr := snapshotting.NewSnapshotManager(smBase, st, true, false, *lazy, false, *wsCoalescing, *wsRecording, *chunkSize, 128*1024*1024, *targetMode, 1, *encryption, false)
+	if err := mgr.ConfigureCompression(snapshotting.CompressionConfig{
+		WorkingSet: *wsCompression,
+		Chunks:     *chunkCompression,
+		Codec:      snapshotting.CompressionCodecZstd,
+		Level:      *zstdLevel,
+		FrameSize:  *zstdFrameSize,
+		Fetchers:   *zstdFetchers,
+	}); err != nil {
+		log.Fatalf("Invalid compression configuration: %v", err)
+	}
+	log.Infof("SNAPSHOT_CONVERTER_COMPRESSION_CONFIG ws=%t chunks=%t codec=zstd level=%d frame_size=%d fetchers=%d",
+		*wsCompression, *chunkCompression, *zstdLevel, *zstdFrameSize, *zstdFetchers)
 	log.Info("Waiting for snapshot manager to initialize chunks...")
 	mgr.WaitForInit()
 

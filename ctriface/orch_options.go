@@ -25,6 +25,8 @@ package ctriface
 import (
 	"encoding/json"
 	"fmt"
+
+	"github.com/vhive-serverless/vhive/snapshotting"
 )
 
 // OrchestratorOption Options to pass to Orchestrator
@@ -231,6 +233,12 @@ func WithWSCoalescing(isWSCoalescing bool) OrchestratorOption {
 func WithWSRecording(isWSRecording bool) OrchestratorOption {
 	return func(o *Orchestrator) {
 		o.isWSRecording = isWSRecording
+	}
+}
+
+func WithCompression(config snapshotting.CompressionConfig) OrchestratorOption {
+	return func(o *Orchestrator) {
+		o.compression = config
 	}
 }
 
