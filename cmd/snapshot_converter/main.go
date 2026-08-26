@@ -108,7 +108,7 @@ func main() {
 	minioSecretKey := flag.String("minioSecretKey", "minio123", "MinIO Secret Key")
 	bucketName := flag.String("bucket", "snapshots", "MinIO bucket name")
 	targetMode := flag.String("mode", snapshotting.SecurityModeNone,
-		"Target security mode (full, partial, no-image-sharing, none)")
+		"Target security mode (full, partial, no-image-sharing, full-dedup, none)")
 	encryption := flag.Bool("encryption", false, "Use encryption")
 	baseDir := flag.String("baseDir", "/tmp", "Base directory containing images folder")
 	wsCoalescing := flag.Bool("wsCoalescing", false, "Enable WS coalescing")
@@ -134,7 +134,10 @@ func main() {
 
 	*targetMode = snapshotting.NormalizeSecurityMode(*targetMode)
 	if !snapshotting.IsValidSecurityMode(*targetMode) {
-		log.Fatalf("Invalid mode %q. Expected one of: full, partial, no-image-sharing, none", *targetMode)
+		log.Fatalf("Invalid mode %q. Expected one of: full, partial, no-image-sharing, full-dedup, none", *targetMode)
+	}
+	if *targetMode == snapshotting.SecurityModeFullDedup && *wsCoalescing {
+		log.Fatal("full-dedup requires -wsCoalescing=false: coalesced private working-set objects are revision-scoped and would not implement full deduplication")
 	}
 	if *chunkSize == 0 {
 		log.Fatalf("chunkSize must be greater than 0")

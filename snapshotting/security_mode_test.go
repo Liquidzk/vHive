@@ -13,10 +13,12 @@ func revisionHash(page []byte, revision string) [md5.Size]byte {
 func TestSecurityModeValidation(t *testing.T) {
 	valid := []string{
 		SecurityModeNone,
+		SecurityModeFullDedup,
 		SecurityModePartial,
 		SecurityModeNoImageSharing,
 		SecurityModeFull,
 		" NO-IMAGE-SHARING ",
+		" FULL-DEDUP ",
 	}
 	for _, mode := range valid {
 		if !IsValidSecurityMode(mode) {
@@ -63,6 +65,9 @@ func TestDeriveChunkHashBySecurityMode(t *testing.T) {
 		expected [md5.Size]byte
 	}{
 		{name: "none-private", mode: SecurityModeNone, page: privatePage, expected: raw(privatePage)},
+		{name: "full-dedup-rootfs", mode: SecurityModeFullDedup, page: rootfsPage, expected: raw(rootfsPage)},
+		{name: "full-dedup-image", mode: SecurityModeFullDedup, page: imagePage, expected: raw(imagePage)},
+		{name: "full-dedup-private", mode: SecurityModeFullDedup, page: privatePage, expected: raw(privatePage)},
 		{name: "partial-rootfs", mode: SecurityModePartial, page: rootfsPage, expected: raw(rootfsPage)},
 		{name: "partial-base", mode: SecurityModePartial, page: basePage, expected: raw(basePage)},
 		{name: "partial-image", mode: SecurityModePartial, page: imagePage, expected: raw(imagePage)},
@@ -98,5 +103,22 @@ func TestNoImageSharingWorkingSetPolicy(t *testing.T) {
 	}
 	if noImage.sharesImagePages() {
 		t.Fatal("no-image-sharing mode must place image working-set pages in the private source")
+	}
+}
+
+func TestFullDedupSharesPrivateChunksAcrossRevisions(t *testing.T) {
+	page := []byte("same-private-page-content")
+	fullDedup := &SnapshotManager{securityMode: SecurityModeFullDedup}
+	first := fullDedup.DeriveChunkHash(page, "revision-a", "example/image:tag")
+	second := fullDedup.DeriveChunkHash(page, "revision-b", "example/image:tag")
+	if first != second {
+		t.Fatalf("full-dedup must reuse the raw content key across revisions: %x != %x", first, second)
+	}
+
+	current := &SnapshotManager{securityMode: SecurityModePartial}
+	first = current.DeriveChunkHash(page, "revision-a", "example/image:tag")
+	second = current.DeriveChunkHash(page, "revision-b", "example/image:tag")
+	if first == second {
+		t.Fatalf("partial mode must keep private chunk keys revision-scoped: %x == %x", first, second)
 	}
 }

@@ -154,6 +154,17 @@ func WithClonePrefix(clonePrefix string) OrchestratorOption {
 	}
 }
 
+// WithDNSNameservers overrides the Kubernetes/Google DNS discovery fallback
+// for microVMs. An empty slice preserves the existing automatic behavior.
+func WithDNSNameservers(nameservers []string) OrchestratorOption {
+	return func(o *Orchestrator) {
+		if len(nameservers) == 0 {
+			return
+		}
+		o.dns = append([]string(nil), nameservers...)
+	}
+}
+
 func WithDockerCredentials(dockerCredentials string) OrchestratorOption {
 	return func(o *Orchestrator) {
 		if dockerCredentials == "" {

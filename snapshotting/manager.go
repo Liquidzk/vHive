@@ -58,10 +58,14 @@ import (
 )
 
 const (
-	chunkPrefix                = "_chunks"
-	wsSharedPrefix             = "ws_shared"
-	wsBaseRootfsKey            = "base_rootfs"
-	SecurityModeNone           = "none"
+	chunkPrefix      = "_chunks"
+	wsSharedPrefix   = "ws_shared"
+	wsBaseRootfsKey  = "base_rootfs"
+	SecurityModeNone = "none"
+	// SecurityModeFullDedup is an intentionally unsafe evaluation baseline.
+	// Every memory chunk is keyed only by its raw content hash, so equal pages
+	// are shared across snapshots and revisions without provenance isolation.
+	SecurityModeFullDedup      = "full-dedup"
 	SecurityModePartial        = "partial"
 	SecurityModeNoImageSharing = "no-image-sharing"
 	SecurityModeFull           = "full"
@@ -81,7 +85,7 @@ func NormalizeSecurityMode(mode string) string {
 
 func IsValidSecurityMode(mode string) bool {
 	switch NormalizeSecurityMode(mode) {
-	case SecurityModeNone, SecurityModePartial, SecurityModeNoImageSharing, SecurityModeFull:
+	case SecurityModeNone, SecurityModeFullDedup, SecurityModePartial, SecurityModeNoImageSharing, SecurityModeFull:
 		return true
 	default:
 		return false

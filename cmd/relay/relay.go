@@ -309,6 +309,7 @@ func main() {
 	netPoolSize := flag.Int("netPoolSize", 10, "Amount of network configs to preallocate in a pool")
 	vethPrefix := flag.String("vethPrefix", "172.17", "Prefix for IP addresses of veth devices, expected subnet is /16")
 	clonePrefix := flag.String("clonePrefix", "172.18", "Prefix for node-accessible IP addresses of uVMs, expected subnet is /16")
+	dnsNameservers := flag.String("dnsNameservers", "", "Comma-separated DNS nameservers for microVMs; empty uses Kubernetes DNS discovery with the existing fallback")
 	vmMemSizeMib := flag.Uint("vmMemSizeMib", 512, "Memory size in MiB for newly created microVMs")
 	dockerCredentials := flag.String("dockerCredentials", `{"docker-credentials":{"ghcr.io":{"username":"","password":""}}}`, "Docker credentials for pulling images from inside a microVM") // https://github.com/firecracker-microvm/firecracker-containerd/blob/main/docker-credential-mmds
 	minioCredentials := flag.String("minioCredentials", "10.0.1.1:9000;minio;minio123", "Minio credentials for uploading/downloading remote firecracker snapshots. Format: <minioAddr>;<minioAccessKey>;<minioSecretKey>")
@@ -318,7 +319,7 @@ func main() {
 	cleaning = flag.Bool("clean", false, "Clean existing snapshots after each invocation")
 	dropCaches = flag.Bool("dropCaches", false, "Drop Linux page caches after each invocation teardown")
 	security := flag.String("security", snapshotting.SecurityModeNone,
-		"Snapshot security mode: none, partial, no-image-sharing, full")
+		"Snapshot security mode: none, full-dedup, partial, no-image-sharing, full")
 	baseSnap = flag.Bool("baseSnap", false, "Use base snapshot of booted VM for snapshot creation")
 	threads := flag.Int("j", 8, "How many concurrent uploads/downloads to run when transferring snapshots")
 	encryption := flag.Bool("encryption", false, "Enable snapshot encryption")
@@ -328,7 +329,21 @@ func main() {
 	}
 	*security = snapshotting.NormalizeSecurityMode(*security)
 	if !snapshotting.IsValidSecurityMode(*security) {
-		log.Fatalf("invalid snapshot security mode %q; expected one of: none, partial, no-image-sharing, full", *security)
+		log.Fatalf("invalid snapshot security mode %q; expected one of: none, full-dedup, partial, no-image-sharing, full", *security)
+	}
+	if *security == snapshotting.SecurityModeFullDedup && *isWSCoalescing {
+		log.Fatal("full-dedup requires -wsCoalescing=false: coalesced private working-set objects are revision-scoped and would not implement full deduplication")
+	}
+	guestDNS := make([]string, 0)
+	for _, candidate := range strings.Split(*dnsNameservers, ",") {
+		candidate = strings.TrimSpace(candidate)
+		if candidate == "" {
+			continue
+		}
+		if net.ParseIP(candidate) == nil {
+			log.Fatalf("invalid microVM DNS nameserver %q", candidate)
+		}
+		guestDNS = append(guestDNS, candidate)
 	}
 
 	imageMap = make(map[string]string)
@@ -391,6 +406,7 @@ func main() {
 		ctriface.WithNetPoolSize(*netPoolSize),
 		ctriface.WithVethPrefix(*vethPrefix),
 		ctriface.WithClonePrefix(*clonePrefix),
+		ctriface.WithDNSNameservers(guestDNS),
 		ctriface.WithVMMemSizeMib(uint32(*vmMemSizeMib)),
 		ctriface.WithDockerCredentials(*dockerCredentials),
 		ctriface.WithMinioAddr(minioAddr),
