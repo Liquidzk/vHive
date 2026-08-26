@@ -128,6 +128,7 @@ func main() {
 	baseDir := flag.String("baseDir", "/tmp", "Base directory containing images folder")
 	wsCoalescing := flag.Bool("wsCoalescing", false, "Enable WS coalescing")
 	wsRecording := flag.Bool("wsRecording", false, "Enable WS recording")
+	lazy := flag.Bool("lazy", false, "Skip reconstructing complete memory files while converting chunked snapshots")
 	chunkSize := flag.Uint64("chunkSize", 4096, "Chunk size for chunking")
 	workers := flag.Int("workers", runtime.NumCPU(), "Number of concurrent snapshot workers")
 	allRevisions := flag.Bool("allRevisions", false, "Process every snapshot revision instead of one representative per function type")
@@ -165,7 +166,7 @@ func main() {
 
 	// Initialize SnapshotManager to load chunk info
 	smBase := filepath.Join(*baseDir, "snapshots")
-	mgr := snapshotting.NewSnapshotManager(smBase, st, true, false, false, false, *wsCoalescing, *wsRecording, *chunkSize, 128*1024*1024, *targetMode, 1, *encryption, false)
+	mgr := snapshotting.NewSnapshotManager(smBase, st, true, false, *lazy, false, *wsCoalescing, *wsRecording, *chunkSize, 128*1024*1024, *targetMode, 1, *encryption, false)
 	log.Info("Waiting for snapshot manager to initialize chunks...")
 	mgr.WaitForInit()
 
