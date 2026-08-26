@@ -175,8 +175,10 @@ func main() {
 	}
 	if _, err := mgr.DownloadSnapshot("base"); err != nil {
 		log.Warnf("Failed to download base snapshot metadata: %v", err)
+		log.Warn("Continuing without base-snapshot chunk classification")
+	} else {
+		mgr.PrepareBaseSnapshotChunks()
 	}
-	mgr.PrepareBaseSnapshotChunks()
 
 	log.Info("Snapshot manager initialized.")
 
