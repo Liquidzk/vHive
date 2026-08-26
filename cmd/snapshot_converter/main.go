@@ -48,6 +48,21 @@ func chooseRepresentativeByType(revisions map[string]bool) map[string]string {
 	return typeToRep
 }
 
+func selectRevisionsForProcessing(revisions map[string]bool, allRevisions bool) []string {
+	selected := make([]string, 0, len(revisions))
+	if allRevisions {
+		for revision := range revisions {
+			selected = append(selected, revision)
+		}
+	} else {
+		for _, representative := range chooseRepresentativeByType(revisions) {
+			selected = append(selected, representative)
+		}
+	}
+	sort.Strings(selected)
+	return selected
+}
+
 func listKnativeServices() ([]string, error) {
 	cmd := exec.Command("kubectl", "get", "ksvc", "-A", "-o", "json")
 	out, err := cmd.Output()
@@ -115,6 +130,8 @@ func main() {
 	wsRecording := flag.Bool("wsRecording", false, "Enable WS recording")
 	chunkSize := flag.Uint64("chunkSize", 4096, "Chunk size for chunking")
 	workers := flag.Int("workers", runtime.NumCPU(), "Number of concurrent snapshot workers")
+	allRevisions := flag.Bool("allRevisions", false, "Process every snapshot revision instead of one representative per function type")
+	serviceFanOut := flag.Bool("serviceFanOut", true, "Copy converted representative snapshots to matching Knative services")
 	flag.Parse()
 
 	log.SetLevel(log.DebugLevel)
@@ -181,20 +198,19 @@ func main() {
 	}
 
 	log.Infof("Found %d snapshots to process", len(snapshots))
-	typeToRep := chooseRepresentativeByType(snapshots)
-	representatives := make([]string, 0, len(typeToRep))
-	for _, rep := range typeToRep {
-		representatives = append(representatives, rep)
+	selectedRevisions := selectRevisionsForProcessing(snapshots, *allRevisions)
+	if *allRevisions {
+		log.Infof("Processing all %d snapshot revisions", len(selectedRevisions))
+	} else {
+		log.Infof("Processing %d representative snapshots (one per function type)", len(selectedRevisions))
 	}
-	sort.Strings(representatives)
-	log.Infof("Processing %d representative snapshots (one per function type)", len(representatives))
 
 	numWorkers := *workers
 	log.Infof("Starting processing with %d workers", numWorkers)
 
 	var wg sync.WaitGroup
-	snapChan := make(chan string, len(representatives))
-	processed := make(map[string]bool, len(representatives))
+	snapChan := make(chan string, len(selectedRevisions))
+	processed := make(map[string]bool, len(selectedRevisions))
 	processedMu := sync.Mutex{}
 
 	for i := 0; i < numWorkers; i++ {
@@ -224,11 +240,16 @@ func main() {
 		}()
 	}
 
-	for _, snapID := range representatives {
+	for _, snapID := range selectedRevisions {
 		snapChan <- snapID
 	}
 	close(snapChan)
 	wg.Wait()
+
+	if !*serviceFanOut {
+		log.Info("Knative service fan-out disabled")
+		return
+	}
 
 	processedByType := make(map[string]string, len(processed))
 	for rep := range processed {
