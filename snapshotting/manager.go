@@ -2224,8 +2224,14 @@ func (mgr *SnapshotManager) uploadChunkedMemoryContent(reader io.Reader, revisio
 	}
 
 	jobs := make(chan chunkJob, 128)
-	errCh := make(chan error, 128)
 	var wg sync.WaitGroup
+	var firstErr error
+	var firstErrOnce sync.Once
+	recordErr := func(err error) {
+		firstErrOnce.Do(func() {
+			firstErr = err
+		})
+	}
 
 	for w := 0; w < workerCount; w++ {
 		wg.Add(1)
@@ -2246,7 +2252,7 @@ func (mgr *SnapshotManager) uploadChunkedMemoryContent(reader io.Reader, revisio
 					lock.Unlock()
 					continue
 				} else if existsErr != nil {
-					errCh <- fmt.Errorf("checking chunk existence %s: %w", job.hash, existsErr)
+					recordErr(fmt.Errorf("checking chunk existence %s: %w", job.hash, existsErr))
 					lock.Unlock()
 					continue
 				}
@@ -2254,14 +2260,14 @@ func (mgr *SnapshotManager) uploadChunkedMemoryContent(reader io.Reader, revisio
 				chunkFilePath := mgr.GetChunkFilePath(job.hash)
 				dir := filepath.Dir(chunkFilePath)
 				if mkErr := os.MkdirAll(dir, os.ModePerm); mkErr != nil {
-					errCh <- fmt.Errorf("creating chunk dir %s: %w", dir, mkErr)
+					recordErr(fmt.Errorf("creating chunk dir %s: %w", dir, mkErr))
 					lock.Unlock()
 					continue
 				}
 
 				chunkFile, createErr := os.Create(chunkFilePath)
 				if createErr != nil {
-					errCh <- fmt.Errorf("creating chunk %s: %w", chunkFilePath, createErr)
+					recordErr(fmt.Errorf("creating chunk %s: %w", chunkFilePath, createErr))
 					lock.Unlock()
 					continue
 				}
@@ -2271,7 +2277,7 @@ func (mgr *SnapshotManager) uploadChunkedMemoryContent(reader io.Reader, revisio
 					encryptedData := make([]byte, len(job.data))
 					if _, encErr := EncryptData(job.data, encryptedData, EncryptionKey[:16]); encErr != nil {
 						chunkFile.Close()
-						errCh <- fmt.Errorf("encrypting chunk %s: %w", job.hash, encErr)
+						recordErr(fmt.Errorf("encrypting chunk %s: %w", job.hash, encErr))
 						lock.Unlock()
 						continue
 					}
@@ -2281,7 +2287,7 @@ func (mgr *SnapshotManager) uploadChunkedMemoryContent(reader io.Reader, revisio
 					toWrite, compressErr = mgr.encodeChunkRepresentation(job.data)
 					if compressErr != nil {
 						chunkFile.Close()
-						errCh <- fmt.Errorf("compressing chunk %s: %w", job.hash, compressErr)
+						recordErr(fmt.Errorf("compressing chunk %s: %w", job.hash, compressErr))
 						lock.Unlock()
 						continue
 					}
@@ -2289,14 +2295,14 @@ func (mgr *SnapshotManager) uploadChunkedMemoryContent(reader io.Reader, revisio
 
 				if _, writeErr := chunkFile.Write(toWrite); writeErr != nil {
 					chunkFile.Close()
-					errCh <- fmt.Errorf("writing chunk %d: %w", job.idx, writeErr)
+					recordErr(fmt.Errorf("writing chunk %d: %w", job.idx, writeErr))
 					lock.Unlock()
 					continue
 				}
 				chunkFile.Close()
 
 				if uploadErr := mgr.uploadFile(activePrefix, chunkFilePath); uploadErr != nil {
-					errCh <- fmt.Errorf("uploading chunk %d: %w", job.idx, uploadErr)
+					recordErr(fmt.Errorf("uploading chunk %d: %w", job.idx, uploadErr))
 					lock.Unlock()
 					continue
 				}
@@ -2316,7 +2322,6 @@ func (mgr *SnapshotManager) uploadChunkedMemoryContent(reader io.Reader, revisio
 		if readErr != nil && readErr != io.EOF && readErr != io.ErrUnexpectedEOF {
 			close(jobs)
 			wg.Wait()
-			close(errCh)
 			return nil, chunkIndex, errors.Wrapf(readErr, "reading chunk %d", chunkIndex)
 		}
 		if n == 0 {
@@ -2339,17 +2344,9 @@ func (mgr *SnapshotManager) uploadChunkedMemoryContent(reader io.Reader, revisio
 
 	close(jobs)
 	wg.Wait()
-	close(errCh)
-
-	var firstErr error
-	for err := range errCh {
-		log.Printf("Chunk upload error: %v", err)
-		if firstErr == nil {
-			firstErr = err
-		}
-	}
 
 	if firstErr != nil {
+		log.Printf("Chunk upload error: %v", firstErr)
 		return nil, chunkIndex, firstErr
 	}
 
@@ -2576,8 +2573,8 @@ func (mgr *SnapshotManager) DownloadAndReturnChunk(hash string) ([]byte, error) 
 
 			chunkFilePath := mgr.GetChunkFilePath(hash)
 			dir := filepath.Dir(chunkFilePath)
-			if err = os.MkdirAll(dir, os.ModePerm); err != nil {
-				log.Errorf("creating chunk directory %s: %v", dir, err)
+			if mkErr := os.MkdirAll(dir, os.ModePerm); mkErr != nil {
+				log.Errorf("creating chunk directory %s: %v", dir, mkErr)
 				return
 			}
 
@@ -3168,10 +3165,13 @@ func (mgr *SnapshotManager) getWorkingSetPathManaged(snap *Snapshot, rawPath str
 	if err != nil {
 		return nil, func() {}, errors.Wrap(err, "allocate compressed working set destination")
 	}
+	var releaseOnce sync.Once
 	release := func() {
-		if err := unix.Munmap(destination); err != nil {
-			log.Warnf("Failed to unmap decoded working set: %v", err)
-		}
+		releaseOnce.Do(func() {
+			if err := unix.Munmap(destination); err != nil {
+				log.Warnf("Failed to unmap decoded working set: %v", err)
+			}
+		})
 	}
 
 	localPayload := false

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/md5"
+	"encoding/binary"
 	"encoding/hex"
 	"fmt"
 	"io"
@@ -159,6 +160,23 @@ func TestCompressionDisabledPreservesRawChunkLayout(t *testing.T) {
 	require.False(t, compressed)
 }
 
+func TestZstdChunkUploadManyErrorsDoesNotDeadlock(t *testing.T) {
+	store := &failingExistsStorage{memoryRangeStorage: newMemoryRangeStorage()}
+	mgr := NewSnapshotManager(t.TempDir(), store, true, false, true, false, false, false,
+		4096, 1024*1024, SecurityModeFullDedup, 4, false, true)
+	require.NoError(t, mgr.ConfigureCompression(CompressionConfig{
+		Chunks: true, Codec: CompressionCodecZstd, Level: 3, FrameSize: 64 * 1024, Fetchers: 4,
+	}))
+
+	raw := make([]byte, 256*4096)
+	for page := 0; page < 256; page++ {
+		binary.LittleEndian.PutUint64(raw[page*4096:], uint64(page))
+	}
+	_, count, err := mgr.uploadChunkedMemoryContent(bytes.NewReader(raw), "many-errors", "test-image")
+	require.Equal(t, 256, count)
+	require.ErrorContains(t, err, "forced Exists failure")
+}
+
 func TestConverterCreatesCompressedObjectsWithoutChangingRawRecipe(t *testing.T) {
 	store := newMemoryRangeStorage()
 	raw := bytes.Repeat([]byte("converter-zstd-source"), 200)
@@ -187,6 +205,14 @@ type memoryRangeStorage struct {
 	mu         sync.Mutex
 	objects    map[string][]byte
 	rangeOpens int
+}
+
+type failingExistsStorage struct {
+	*memoryRangeStorage
+}
+
+func (store *failingExistsStorage) Exists(string) (bool, error) {
+	return false, fmt.Errorf("forced Exists failure")
 }
 
 func newMemoryRangeStorage() *memoryRangeStorage {
