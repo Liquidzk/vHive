@@ -208,8 +208,18 @@ func main() {
 	mgr.WaitForInit()
 
 	log.Infof("Preparing base snapshot chunks...")
-	if err := mgr.EnsureRemoteSnapshotChunked("base"); err != nil {
-		log.Warnf("Failed to convert base snapshot: %v", err)
+	var baseEnsureErr error
+	if *preserveRecipe {
+		// The base recipe is already provenance-classified by the raw pass, just
+		// like every revision recipe below.  Re-running the security rewrite here
+		// would salt private base hashes a second time and make the Raw and Zstd
+		// corpora semantically different.
+		baseEnsureErr = mgr.EnsureRemoteSnapshotChunkRepresentation("base")
+	} else {
+		baseEnsureErr = mgr.EnsureRemoteSnapshotChunked("base")
+	}
+	if baseEnsureErr != nil {
+		log.Fatalf("Failed to convert base snapshot: %v", baseEnsureErr)
 	}
 	if _, err := mgr.DownloadSnapshot("base"); err != nil {
 		log.Warnf("Failed to download base snapshot metadata: %v", err)
