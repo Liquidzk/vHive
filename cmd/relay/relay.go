@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -69,6 +70,32 @@ func waitForTCP(ctx context.Context, address string, timeout time.Duration) erro
 		case <-time.After(readyRetryInterval):
 		}
 	}
+}
+
+func functionEndpointPort(relayArgs string) (string, error) {
+	const defaultPort = "50051"
+	fields := strings.Fields(relayArgs)
+	for i, field := range fields {
+		var value string
+		switch {
+		case strings.HasPrefix(field, "--function-endpoint-port="):
+			value = strings.TrimPrefix(field, "--function-endpoint-port=")
+		case field == "--function-endpoint-port":
+			if i+1 >= len(fields) {
+				return "", fmt.Errorf("--function-endpoint-port requires a value")
+			}
+			value = fields[i+1]
+		default:
+			continue
+		}
+
+		port, err := strconv.ParseUint(value, 10, 16)
+		if err != nil || port == 0 {
+			return "", fmt.Errorf("invalid --function-endpoint-port %q", value)
+		}
+		return strconv.FormatUint(port, 10), nil
+	}
+	return defaultPort, nil
 }
 
 func grpcStatus(header http.Header) string {
@@ -137,6 +164,12 @@ func handler(w http.ResponseWriter, r *http.Request) {
 	if args != "" {
 		argsArr = strings.Split(args, " ")
 	}
+	relayArgs := r.Header.Get("relayArgs")
+	functionPort, parseErr := functionEndpointPort(relayArgs)
+	if parseErr != nil {
+		http.Error(w, fmt.Sprintf("Invalid Relay Args: %v", parseErr), http.StatusBadRequest)
+		return
+	}
 	log.Debugf("env vars: %v, args: %v", envArr, argsArr)
 
 	var resp *ctriface.StartVMResponse
@@ -191,7 +224,7 @@ func handler(w http.ResponseWriter, r *http.Request) {
 	vmId := resp.VMID
 
 	log.Debugf("created VM with ID %s and IP %s for revision %s", resp.VMID, resp.GuestIP, r.Header.Get("revision"))
-	functionEndpoint := resp.GuestIP + ":50051"
+	functionEndpoint := net.JoinHostPort(resp.GuestIP, functionPort)
 	if err := waitForTCP(ctx, functionEndpoint, functionReadyTimeout); err != nil {
 		log.Errorf("function readiness check failed for VM %s: %v", vmId, err)
 		if stopErr := orch.StopSingleVM(ctx, vmId); stopErr != nil {
@@ -202,7 +235,6 @@ func handler(w http.ResponseWriter, r *http.Request) {
 	}
 	log.Debugf("function endpoint %s is ready", functionEndpoint)
 
-	relayArgs := r.Header.Get("relayArgs")
 	endpoint := functionEndpoint
 	if relayArgs != "" {
 		mu.Lock()

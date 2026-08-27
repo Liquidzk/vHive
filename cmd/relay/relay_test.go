@@ -8,6 +8,40 @@ import (
 	"time"
 )
 
+func TestFunctionEndpointPort(t *testing.T) {
+	tests := []struct {
+		name      string
+		args      string
+		want      string
+		wantError bool
+	}{
+		{name: "default", args: "--function-name=aes-go", want: "50051"},
+		{name: "equals", args: "--function-endpoint-port=7000 --function-name=currencyservice", want: "7000"},
+		{name: "separate", args: "--function-endpoint-port 8080 --function-name=emailservice", want: "8080"},
+		{name: "missing", args: "--function-endpoint-port", wantError: true},
+		{name: "zero", args: "--function-endpoint-port=0", wantError: true},
+		{name: "not-number", args: "--function-endpoint-port=http", wantError: true},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			got, err := functionEndpointPort(test.args)
+			if test.wantError {
+				if err == nil {
+					t.Fatalf("functionEndpointPort(%q) unexpectedly succeeded with %q", test.args, got)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("functionEndpointPort(%q): %v", test.args, err)
+			}
+			if got != test.want {
+				t.Fatalf("functionEndpointPort(%q) = %q, want %q", test.args, got, test.want)
+			}
+		})
+	}
+}
+
 func TestWaitForTCPReady(t *testing.T) {
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
