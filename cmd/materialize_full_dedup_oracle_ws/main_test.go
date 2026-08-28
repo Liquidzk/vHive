@@ -80,3 +80,29 @@ func TestCanonicalHashes(t *testing.T) {
 		}
 	}
 }
+
+func TestParseHashIndexedSource(t *testing.T) {
+	first := bytes.Repeat([]byte{0x11}, pageSize)
+	second := bytes.Repeat([]byte{0x22}, pageSize)
+	firstHash := fmt.Sprintf("%x", md5.Sum(first)) // #nosec G401 -- fixture for the existing identity.
+	secondHash := fmt.Sprintf("%x", md5.Sum(second))
+	index := []byte(fmt.Sprintf("hash\n%s\n%s\n", firstHash, secondHash))
+	content := append(append([]byte{}, first...), second...)
+
+	got, err := parseHashIndexedSource(index, content)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got[firstHash], first) || !bytes.Equal(got[secondHash], second) {
+		t.Fatal("parsed source content differs from fixture")
+	}
+
+	if _, err := parseHashIndexedSource([]byte("wrong\n"), content); err == nil {
+		t.Fatal("accepted a source without a hash header")
+	}
+	badContent := append([]byte{}, content...)
+	badContent[0] ^= 0xff
+	if _, err := parseHashIndexedSource(index, badContent); err == nil {
+		t.Fatal("accepted a hash/content mismatch")
+	}
+}

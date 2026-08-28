@@ -10,12 +10,14 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"crypto/md5" // #nosec G501 -- MD5 is the existing snapshot content identity, not a cryptographic claim.
 	"encoding/csv"
 	"encoding/hex"
 	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
 	"os"
 	"sort"
 	"strconv"
@@ -52,6 +54,13 @@ type report struct {
 	PayloadObject             string `json:"payload_object"`
 	ManifestObject            string `json:"manifest_object"`
 	AssemblyElapsedUS         int64  `json:"assembly_elapsed_us_excluded"`
+	ReferenceFramework        string `json:"reference_framework,omitempty"`
+	ReferenceEndpoint         string `json:"reference_endpoint,omitempty"`
+	ReferenceImageKey         string `json:"reference_image_key,omitempty"`
+	SharedBaseHashes          int    `json:"shared_base_hashes,omitempty"`
+	SharedImageHashes         int    `json:"shared_image_hashes,omitempty"`
+	PrivateWorkingSetPages    int    `json:"private_working_set_pages,omitempty"`
+	CoveredWorkingSetPages    int    `json:"covered_working_set_pages,omitempty"`
 }
 
 type pageResult struct {
@@ -209,8 +218,186 @@ func verifyAndCollect(store *storage.MinioStorage, hashes []string, wanted map[s
 	return collected, nil
 }
 
+func parseHashIndexedSource(index, content []byte) (map[string][]byte, error) {
+	records, err := csv.NewReader(bytes.NewReader(index)).ReadAll()
+	if err != nil {
+		return nil, fmt.Errorf("parse hash-indexed source: %w", err)
+	}
+	if len(records) == 0 || len(records[0]) == 0 || records[0][0] != "hash" {
+		return nil, fmt.Errorf("hash-indexed source must begin with a hash header")
+	}
+	hashes := make([]string, 0, len(records)-1)
+	for _, record := range records[1:] {
+		if len(record) == 0 || strings.TrimSpace(record[0]) == "" {
+			continue
+		}
+		hashes = append(hashes, strings.TrimSpace(record[0]))
+	}
+	if len(content) != len(hashes)*pageSize {
+		return nil, fmt.Errorf("hash-indexed content size %d does not match %d pages", len(content), len(hashes))
+	}
+	result := make(map[string][]byte, len(hashes))
+	for i, hash := range hashes {
+		if len(hash) != md5.Size*2 {
+			return nil, fmt.Errorf("invalid shared page hash %q", hash)
+		}
+		page := content[i*pageSize : (i+1)*pageSize]
+		sum := md5.Sum(page) // #nosec G401 -- validates the existing raw-content identity.
+		if actual := hex.EncodeToString(sum[:]); actual != hash {
+			return nil, fmt.Errorf("shared page key/content mismatch: key=%s content_md5=%s", hash, actual)
+		}
+		if _, duplicate := result[hash]; duplicate {
+			return nil, fmt.Errorf("duplicate shared page hash %s", hash)
+		}
+		result[hash] = append([]byte(nil), page...)
+	}
+	return result, nil
+}
+
+type splitSnapView struct {
+	baseHashes       int
+	imageHashes      int
+	privatePages     int
+	coveredPages     int
+	privateRawBytes  int
+	privateCompBytes int
+	privateFrames    int
+}
+
+func validateSplitSnapView(
+	reference *storage.MinioStorage,
+	snapshot, imageKey string,
+	recipeHashes []string,
+	wsPFNs []int,
+	canonical map[string][]byte,
+	workers int,
+) (splitSnapView, error) {
+	load := func(key string) ([]byte, error) {
+		data, err := reference.DownloadObject(key)
+		if err != nil {
+			return nil, fmt.Errorf("download SplitSnap reference object %s: %w", key, err)
+		}
+		return data, nil
+	}
+	baseIndex, err := load("ws_shared/base_rootfs/index")
+	if err != nil {
+		return splitSnapView{}, err
+	}
+	baseContent, err := load("ws_shared/base_rootfs/content")
+	if err != nil {
+		return splitSnapView{}, err
+	}
+	basePages, err := parseHashIndexedSource(baseIndex, baseContent)
+	if err != nil {
+		return splitSnapView{}, fmt.Errorf("validate SplitSnap base source: %w", err)
+	}
+	imagePrefix := fmt.Sprintf("ws_shared/images/%s", imageKey)
+	imageIndex, err := load(imagePrefix + "/index")
+	if err != nil {
+		return splitSnapView{}, err
+	}
+	imageContent, err := load(imagePrefix + "/content")
+	if err != nil {
+		return splitSnapView{}, err
+	}
+	imagePages, err := parseHashIndexedSource(imageIndex, imageContent)
+	if err != nil {
+		return splitSnapView{}, fmt.Errorf("validate SplitSnap image source: %w", err)
+	}
+
+	privatePrefix := snapshot + "/working_set_pages_content_private"
+	privateIndex, err := load(snapshot + "/working_set_pages_index_private")
+	if err != nil {
+		return splitSnapView{}, err
+	}
+	privatePFNs, err := parseWorkingSetPFNs(privateIndex, len(recipeHashes))
+	if err != nil {
+		return splitSnapView{}, fmt.Errorf("parse SplitSnap private index: %w", err)
+	}
+	privateRaw, err := load(privatePrefix)
+	if err != nil {
+		return splitSnapView{}, err
+	}
+	if len(privateRaw) != len(privatePFNs)*pageSize {
+		return splitSnapView{}, fmt.Errorf("private WS content size %d does not match %d PFNs", len(privateRaw), len(privatePFNs))
+	}
+	privateByPFN := make(map[int][]byte, len(privatePFNs))
+	for i, pfn := range privatePFNs {
+		page := privateRaw[i*pageSize : (i+1)*pageSize]
+		sum := md5.Sum(page) // #nosec G401 -- validates the existing raw-content identity.
+		hash := hex.EncodeToString(sum[:])
+		if hash != recipeHashes[pfn] {
+			return splitSnapView{}, fmt.Errorf("private PFN %d content hash %s does not match Full Dedup recipe %s", pfn, hash, recipeHashes[pfn])
+		}
+		privateByPFN[pfn] = append([]byte(nil), page...)
+	}
+
+	manifestData, err := load(privatePrefix + ".zstd.json")
+	if err != nil {
+		return splitSnapView{}, err
+	}
+	manifest, err := zstdstream.ParseManifest(manifestData)
+	if err != nil {
+		return splitSnapView{}, fmt.Errorf("parse SplitSnap private WS manifest: %w", err)
+	}
+	payload, err := load(privatePrefix + ".zstd.frames")
+	if err != nil {
+		return splitSnapView{}, err
+	}
+	decoded := make([]byte, manifest.RawSize)
+	openRange := func(offset, length int64) (io.ReadCloser, error) {
+		if offset < 0 || length <= 0 || offset+length > int64(len(payload)) {
+			return nil, fmt.Errorf("invalid private WS compressed range [%d,%d)", offset, offset+length)
+		}
+		return io.NopCloser(bytes.NewReader(payload[offset : offset+length])), nil
+	}
+	if err := zstdstream.Decode(context.Background(), manifest, openRange, decoded, workers); err != nil {
+		return splitSnapView{}, fmt.Errorf("decode SplitSnap private WS: %w", err)
+	}
+	if !bytes.Equal(decoded, privateRaw) {
+		return splitSnapView{}, fmt.Errorf("SplitSnap compressed private WS does not decode to its raw source")
+	}
+
+	wsSet := make(map[int]struct{}, len(wsPFNs))
+	covered := 0
+	for _, pfn := range wsPFNs {
+		wsSet[pfn] = struct{}{}
+		hash := recipeHashes[pfn]
+		var page []byte
+		if private, ok := privateByPFN[pfn]; ok {
+			page = private
+		} else if base, ok := basePages[hash]; ok {
+			page = base
+		} else if image, ok := imagePages[hash]; ok {
+			page = image
+		} else {
+			return splitSnapView{}, fmt.Errorf("working-set PFN %d hash %s is absent from every SplitSnap source", pfn, hash)
+		}
+		if !bytes.Equal(page, canonical[hash]) {
+			return splitSnapView{}, fmt.Errorf("working-set PFN %d differs between SplitSnap view and Full Dedup canonical store", pfn)
+		}
+		covered++
+	}
+	for pfn := range privateByPFN {
+		if _, ok := wsSet[pfn]; !ok {
+			return splitSnapView{}, fmt.Errorf("private PFN %d is absent from the accepted working set", pfn)
+		}
+	}
+	return splitSnapView{
+		baseHashes:       len(basePages),
+		imageHashes:      len(imagePages),
+		privatePages:     len(privatePFNs),
+		coveredPages:     covered,
+		privateRawBytes:  len(privateRaw),
+		privateCompBytes: len(payload),
+		privateFrames:    len(manifest.Frames),
+	}, nil
+}
+
 func main() {
 	minioURL := flag.String("minioURL", "127.0.0.1:9000", "MinIO endpoint")
+	referenceMinioURL := flag.String("referenceMinioURL", "", "accepted SplitSnap MinIO endpoint used to validate the transient restore view")
+	referenceImageKey := flag.String("referenceImageKey", "aes-go", "SplitSnap ws_shared image key")
 	accessKey := flag.String("minioAccessKey", "minio", "MinIO access key")
 	secretKey := flag.String("minioSecretKey", "minio123", "MinIO secret key")
 	bucket := flag.String("bucket", "snapshots", "MinIO bucket")
@@ -308,6 +495,68 @@ func main() {
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "verify global page store: %v\n", err)
 		os.Exit(1)
+	}
+	if strings.TrimSpace(*referenceMinioURL) != "" {
+		referenceClient, clientErr := minio.New(*referenceMinioURL, &minio.Options{
+			Creds:  credentials.NewStaticV4(*accessKey, *secretKey, ""),
+			Secure: false,
+		})
+		if clientErr != nil {
+			fmt.Fprintf(os.Stderr, "create SplitSnap reference client: %v\n", clientErr)
+			os.Exit(1)
+		}
+		referenceStore, storeErr := storage.NewMinioStorage(referenceClient, *bucket)
+		if storeErr != nil {
+			fmt.Fprintf(os.Stderr, "open SplitSnap reference store: %v\n", storeErr)
+			os.Exit(1)
+		}
+		view, viewErr := validateSplitSnapView(referenceStore, *snapshot, *referenceImageKey, recipeHashes, pfns, pageByHash, *workers)
+		if viewErr != nil {
+			fmt.Fprintf(os.Stderr, "validate SplitSnap-framework Full Dedup view: %v\n", viewErr)
+			os.Exit(1)
+		}
+		result := report{
+			Method:                    "unsafe Full Dedup oracle inside the SplitSnap framework; all persistent pages use global raw-content keys while the accepted SplitSnap shared/private coalesced WS view is an uncounted transient restore input",
+			TimingBoundary:            "transient SplitSnap-format WS assembly is excluded; measured restore begins after that view exists",
+			Snapshot:                  *snapshot,
+			PageSize:                  pageSize,
+			RecipeReferences:          len(recipeHashes),
+			RecipeUniqueHashes:        len(uniqueRecipe),
+			CanonicalPageObjects:      len(allCanonicalHashes),
+			CanonicalUnreferenced:     len(allCanonicalHashes) - len(uniqueRecipe),
+			VerifiedUniquePageObjects: len(allCanonicalHashes),
+			WorkingSetPages:           len(pfns),
+			WorkingSetUniqueHashes:    len(wanted),
+			RawBytes:                  view.privateRawBytes,
+			CompressedBytes:           view.privateCompBytes,
+			CompressionRatio:          fmt.Sprintf("%.6f", float64(view.privateRawBytes)/float64(view.privateCompBytes)),
+			ZstdLevel:                 3,
+			ZstdFrameSize:             1024 * 1024,
+			ZstdFrames:                view.privateFrames,
+			PayloadObject:             *snapshot + "/working_set_pages_content_private.zstd.frames",
+			ManifestObject:            *snapshot + "/working_set_pages_content_private.zstd.json",
+			AssemblyElapsedUS:         time.Since(started).Microseconds(),
+			ReferenceFramework:        "SplitSnap partial/base-snapshot/shared-base/shared-image/coalesced-private-WS",
+			ReferenceEndpoint:         *referenceMinioURL,
+			ReferenceImageKey:         *referenceImageKey,
+			SharedBaseHashes:          view.baseHashes,
+			SharedImageHashes:         view.imageHashes,
+			PrivateWorkingSetPages:    view.privatePages,
+			CoveredWorkingSetPages:    view.coveredPages,
+		}
+		reportData, marshalErr := json.MarshalIndent(result, "", "  ")
+		if marshalErr != nil {
+			fmt.Fprintf(os.Stderr, "marshal report: %v\n", marshalErr)
+			os.Exit(1)
+		}
+		if *reportPath != "" {
+			if writeErr := os.WriteFile(*reportPath, append(reportData, '\n'), 0644); writeErr != nil {
+				fmt.Fprintf(os.Stderr, "write report: %v\n", writeErr)
+				os.Exit(1)
+			}
+		}
+		fmt.Println(string(reportData))
+		return
 	}
 
 	raw := make([]byte, 0, len(pfns)*pageSize)
