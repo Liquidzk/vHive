@@ -1,0 +1,370 @@
+// materialize_full_dedup_oracle_ws constructs an explicitly idealized,
+// revision-local transfer view from a globally content-addressed page store.
+//
+// The canonical storage representation remains one object per unique raw page
+// hash.  The generated coalesced object is an ephemeral evaluation artifact:
+// its creation latency and bytes must not be counted as part of Full Dedup's
+// persistent footprint.  It exists only to measure the best-case transfer and
+// restore path after a hypothetical zero-cost gather operation.
+package main
+
+import (
+	"bytes"
+	"crypto/md5" // #nosec G501 -- MD5 is the existing snapshot content identity, not a cryptographic claim.
+	"encoding/csv"
+	"encoding/hex"
+	"encoding/json"
+	"flag"
+	"fmt"
+	"os"
+	"sort"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/minio/minio-go/v7"
+	"github.com/minio/minio-go/v7/pkg/credentials"
+	"github.com/vhive-serverless/vhive/snapshotting/zstdstream"
+	"github.com/vhive-serverless/vhive/storage"
+)
+
+const pageSize = 4096
+
+type report struct {
+	Method                    string `json:"method"`
+	TimingBoundary            string `json:"timing_boundary"`
+	Snapshot                  string `json:"snapshot"`
+	PageSize                  int    `json:"page_size"`
+	RecipeReferences          int    `json:"recipe_references"`
+	RecipeUniqueHashes        int    `json:"recipe_unique_hashes"`
+	CanonicalPageObjects      int    `json:"canonical_page_objects"`
+	CanonicalUnreferenced     int    `json:"canonical_unreferenced_objects"`
+	VerifiedUniquePageObjects int    `json:"verified_unique_page_objects"`
+	WorkingSetPages           int    `json:"working_set_pages"`
+	WorkingSetUniqueHashes    int    `json:"working_set_unique_hashes"`
+	RawBytes                  int    `json:"raw_bytes"`
+	CompressedBytes           int    `json:"compressed_bytes"`
+	CompressionRatio          string `json:"compression_ratio"`
+	ZstdLevel                 int    `json:"zstd_level"`
+	ZstdFrameSize             int64  `json:"zstd_frame_size"`
+	ZstdFrames                int    `json:"zstd_frames"`
+	PayloadObject             string `json:"payload_object"`
+	ManifestObject            string `json:"manifest_object"`
+	AssemblyElapsedUS         int64  `json:"assembly_elapsed_us_excluded"`
+}
+
+type pageResult struct {
+	hash string
+	data []byte
+	err  error
+}
+
+func chunkObject(hash string) string {
+	return fmt.Sprintf("_chunks/%s/%s", hash[:2], hash)
+}
+
+func parseRecipe(data []byte) ([]string, error) {
+	if len(data)%md5.Size != 0 {
+		return nil, fmt.Errorf("recipe size %d is not divisible by %d", len(data), md5.Size)
+	}
+	hashes := make([]string, 0, len(data)/md5.Size)
+	for offset := 0; offset < len(data); offset += md5.Size {
+		hashes = append(hashes, hex.EncodeToString(data[offset:offset+md5.Size]))
+	}
+	return hashes, nil
+}
+
+func parseWorkingSetPFNs(data []byte, recipePages int) ([]int, error) {
+	records, err := csv.NewReader(bytes.NewReader(data)).ReadAll()
+	if err != nil {
+		return nil, fmt.Errorf("parse working-set CSV: %w", err)
+	}
+	if len(records) == 0 || len(records[0]) == 0 || records[0][0] != "pfn" {
+		return nil, fmt.Errorf("working-set CSV must begin with a pfn header")
+	}
+	pfns := make([]int, 0, len(records)-1)
+	seen := make(map[int]struct{}, len(records)-1)
+	for row, record := range records[1:] {
+		if len(record) == 0 || strings.TrimSpace(record[0]) == "" {
+			continue
+		}
+		pfn64, parseErr := strconv.ParseUint(strings.TrimSpace(record[0]), 10, 64)
+		if parseErr != nil {
+			return nil, fmt.Errorf("parse pfn at row %d: %w", row+2, parseErr)
+		}
+		if pfn64 >= uint64(recipePages) {
+			return nil, fmt.Errorf("pfn %d at row %d exceeds recipe page count %d", pfn64, row+2, recipePages)
+		}
+		pfn := int(pfn64)
+		if _, duplicate := seen[pfn]; duplicate {
+			return nil, fmt.Errorf("duplicate pfn %d at row %d", pfn, row+2)
+		}
+		seen[pfn] = struct{}{}
+		pfns = append(pfns, pfn)
+	}
+	if len(pfns) == 0 {
+		return nil, fmt.Errorf("working-set CSV has no pages")
+	}
+	return pfns, nil
+}
+
+func uniqueSorted(values []string) []string {
+	seen := make(map[string]struct{}, len(values))
+	for _, value := range values {
+		seen[value] = struct{}{}
+	}
+	result := make([]string, 0, len(seen))
+	for value := range seen {
+		result = append(result, value)
+	}
+	sort.Strings(result)
+	return result
+}
+
+func canonicalHashes(objectKeys []string) ([]string, map[string]struct{}, error) {
+	hashes := make([]string, 0, len(objectKeys))
+	seen := make(map[string]struct{}, len(objectKeys))
+	for _, key := range objectKeys {
+		parts := strings.Split(key, "/")
+		if len(parts) != 3 || parts[0] != "_chunks" || len(parts[1]) != 2 || len(parts[2]) != md5.Size*2 {
+			return nil, nil, fmt.Errorf("unexpected canonical page object key %q", key)
+		}
+		hash := parts[2]
+		if _, err := hex.DecodeString(hash); err != nil {
+			return nil, nil, fmt.Errorf("decode canonical page hash %q: %w", hash, err)
+		}
+		if key != chunkObject(hash) {
+			return nil, nil, fmt.Errorf("canonical page object %q is not stored under its hash prefix", key)
+		}
+		if _, duplicate := seen[hash]; duplicate {
+			return nil, nil, fmt.Errorf("canonical page hash %s appears more than once", hash)
+		}
+		seen[hash] = struct{}{}
+		hashes = append(hashes, hash)
+	}
+	sort.Strings(hashes)
+	return hashes, seen, nil
+}
+
+func verifyAndCollect(store *storage.MinioStorage, hashes []string, wanted map[string]struct{}, workers int) (map[string][]byte, error) {
+	if workers < 1 {
+		workers = 1
+	}
+	jobs := make(chan string)
+	results := make(chan pageResult, workers)
+	var wg sync.WaitGroup
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for hash := range jobs {
+				data, err := store.DownloadObject(chunkObject(hash))
+				if err == nil && len(data) != pageSize {
+					err = fmt.Errorf("page object %s has size %d, expected %d", hash, len(data), pageSize)
+				}
+				if err == nil {
+					sum := md5.Sum(data) // #nosec G401 -- validates the existing raw-content object key.
+					if actual := hex.EncodeToString(sum[:]); actual != hash {
+						err = fmt.Errorf("page object key/content mismatch: key=%s content_md5=%s", hash, actual)
+					}
+				}
+				if err == nil {
+					if _, keep := wanted[hash]; !keep {
+						data = nil
+					}
+				}
+				results <- pageResult{hash: hash, data: data, err: err}
+			}
+		}()
+	}
+	go func() {
+		for _, hash := range hashes {
+			jobs <- hash
+		}
+		close(jobs)
+		wg.Wait()
+		close(results)
+	}()
+
+	collected := make(map[string][]byte, len(wanted))
+	var firstErr error
+	for result := range results {
+		if result.err != nil {
+			if firstErr == nil {
+				firstErr = result.err
+			}
+			continue
+		}
+		if result.data != nil {
+			collected[result.hash] = result.data
+		}
+	}
+	if firstErr != nil {
+		return nil, firstErr
+	}
+	if len(collected) != len(wanted) {
+		return nil, fmt.Errorf("collected %d working-set hashes, expected %d", len(collected), len(wanted))
+	}
+	return collected, nil
+}
+
+func main() {
+	minioURL := flag.String("minioURL", "127.0.0.1:9000", "MinIO endpoint")
+	accessKey := flag.String("minioAccessKey", "minio", "MinIO access key")
+	secretKey := flag.String("minioSecretKey", "minio123", "MinIO secret key")
+	bucket := flag.String("bucket", "snapshots", "MinIO bucket")
+	snapshot := flag.String("snapshot", "", "snapshot revision to materialize")
+	workers := flag.Int("workers", 28, "concurrent page verification workers")
+	zstdLevel := flag.Int("zstdLevel", 3, "Zstd compression level")
+	frameSize := flag.Int64("zstdFrameSize", 1024*1024, "uncompressed bytes per independent frame")
+	reportPath := flag.String("report", "", "optional local JSON report path")
+	overwrite := flag.Bool("overwrite", false, "replace an existing transient WS view")
+	flag.Parse()
+
+	if strings.TrimSpace(*snapshot) == "" {
+		fmt.Fprintln(os.Stderr, "-snapshot is required")
+		os.Exit(2)
+	}
+	if *workers < 1 || *frameSize < pageSize || *frameSize%pageSize != 0 {
+		fmt.Fprintln(os.Stderr, "workers must be positive and zstdFrameSize must be a positive multiple of 4096")
+		os.Exit(2)
+	}
+
+	client, err := minio.New(*minioURL, &minio.Options{
+		Creds:  credentials.NewStaticV4(*accessKey, *secretKey, ""),
+		Secure: false,
+	})
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "create MinIO client: %v\n", err)
+		os.Exit(1)
+	}
+	store, err := storage.NewMinioStorage(client, *bucket)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "open object store: %v\n", err)
+		os.Exit(1)
+	}
+
+	payloadObject := fmt.Sprintf("%s/working_set_pages_content.zstd.frames", *snapshot)
+	manifestObject := fmt.Sprintf("%s/working_set_pages_content.zstd.json", *snapshot)
+	for _, object := range []string{payloadObject, manifestObject} {
+		exists, existsErr := store.Exists(object)
+		if existsErr != nil {
+			fmt.Fprintf(os.Stderr, "check transient object %s: %v\n", object, existsErr)
+			os.Exit(1)
+		}
+		if exists && !*overwrite {
+			fmt.Fprintf(os.Stderr, "refusing existing transient object %s without -overwrite\n", object)
+			os.Exit(1)
+		}
+	}
+
+	started := time.Now()
+	recipe, err := store.DownloadObject(fmt.Sprintf("%s/recipe_file", *snapshot))
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "download recipe: %v\n", err)
+		os.Exit(1)
+	}
+	recipeHashes, err := parseRecipe(recipe)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+	wsCSV, err := store.DownloadObject(fmt.Sprintf("%s/working_set_pages", *snapshot))
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "download working set: %v\n", err)
+		os.Exit(1)
+	}
+	pfns, err := parseWorkingSetPFNs(wsCSV, len(recipeHashes))
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+
+	wsHashes := make([]string, len(pfns))
+	wanted := make(map[string]struct{}, len(pfns))
+	for index, pfn := range pfns {
+		wsHashes[index] = recipeHashes[pfn]
+		wanted[recipeHashes[pfn]] = struct{}{}
+	}
+	uniqueRecipe := uniqueSorted(recipeHashes)
+	pageObjectKeys, err := store.ListObjects("_chunks/", true)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "list canonical page store: %v\n", err)
+		os.Exit(1)
+	}
+	allCanonicalHashes, canonicalSet, err := canonicalHashes(pageObjectKeys)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+	for _, hash := range uniqueRecipe {
+		if _, exists := canonicalSet[hash]; !exists {
+			fmt.Fprintf(os.Stderr, "recipe hash %s is absent from the canonical page store\n", hash)
+			os.Exit(1)
+		}
+	}
+	pageByHash, err := verifyAndCollect(store, allCanonicalHashes, wanted, *workers)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "verify global page store: %v\n", err)
+		os.Exit(1)
+	}
+
+	raw := make([]byte, 0, len(pfns)*pageSize)
+	for _, hash := range wsHashes {
+		raw = append(raw, pageByHash[hash]...)
+	}
+	payload, manifest, err := zstdstream.Encode(raw, *frameSize, *zstdLevel)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "encode coalesced WS: %v\n", err)
+		os.Exit(1)
+	}
+	manifestData, err := zstdstream.MarshalManifest(manifest)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "marshal coalesced WS manifest: %v\n", err)
+		os.Exit(1)
+	}
+	if err := store.UploadObject(payloadObject, bytes.NewReader(payload), int64(len(payload))); err != nil {
+		fmt.Fprintf(os.Stderr, "upload transient payload: %v\n", err)
+		os.Exit(1)
+	}
+	if err := store.UploadObject(manifestObject, bytes.NewReader(manifestData), int64(len(manifestData))); err != nil {
+		fmt.Fprintf(os.Stderr, "upload transient manifest: %v\n", err)
+		os.Exit(1)
+	}
+
+	result := report{
+		Method:                    "unsafe Full Dedup oracle with zero-cost WS assembly; canonical pages are globally keyed by raw MD5 and the revision-local coalesced object is an uncounted transient transfer view",
+		TimingBoundary:            "assembly_elapsed_us_excluded; measured restore begins after the transient coalesced WS view exists",
+		Snapshot:                  *snapshot,
+		PageSize:                  pageSize,
+		RecipeReferences:          len(recipeHashes),
+		RecipeUniqueHashes:        len(uniqueRecipe),
+		CanonicalPageObjects:      len(allCanonicalHashes),
+		CanonicalUnreferenced:     len(allCanonicalHashes) - len(uniqueRecipe),
+		VerifiedUniquePageObjects: len(allCanonicalHashes),
+		WorkingSetPages:           len(pfns),
+		WorkingSetUniqueHashes:    len(wanted),
+		RawBytes:                  len(raw),
+		CompressedBytes:           len(payload),
+		CompressionRatio:          fmt.Sprintf("%.6f", float64(len(raw))/float64(len(payload))),
+		ZstdLevel:                 *zstdLevel,
+		ZstdFrameSize:             *frameSize,
+		ZstdFrames:                len(manifest.Frames),
+		PayloadObject:             payloadObject,
+		ManifestObject:            manifestObject,
+		AssemblyElapsedUS:         time.Since(started).Microseconds(),
+	}
+	reportData, err := json.MarshalIndent(result, "", "  ")
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "marshal report: %v\n", err)
+		os.Exit(1)
+	}
+	if *reportPath != "" {
+		if err := os.WriteFile(*reportPath, append(reportData, '\n'), 0644); err != nil {
+			fmt.Fprintf(os.Stderr, "write report: %v\n", err)
+			os.Exit(1)
+		}
+	}
+	fmt.Println(string(reportData))
+}
