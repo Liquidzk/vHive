@@ -225,18 +225,24 @@ func handler(w http.ResponseWriter, r *http.Request) {
 
 	log.Debugf("created VM with ID %s and IP %s for revision %s", resp.VMID, resp.GuestIP, r.Header.Get("revision"))
 	functionEndpoint := net.JoinHostPort(resp.GuestIP, functionPort)
-	if err := waitForTCP(ctx, functionEndpoint, functionReadyTimeout); err != nil {
-		log.Errorf("function readiness check failed for VM %s: %v", vmId, err)
-		if stopErr := orch.StopSingleVM(ctx, vmId); stopErr != nil {
-			log.Errorf("failed to stop unready VM %s: %v", vmId, stopErr)
-		}
-		http.Error(w, fmt.Sprintf("Function Readiness Error: %v", err), http.StatusServiceUnavailable)
-		return
-	}
-	log.Debugf("function endpoint %s is ready", functionEndpoint)
-
 	endpoint := functionEndpoint
 	if relayArgs != "" {
+		// The auxiliary vSwarm relay cannot establish its downstream gRPC
+		// connection until the restored function is listening.  Keep this
+		// guard only for that compatibility path.  The paper's request path
+		// carries the function RPC directly and must be proxied immediately;
+		// an unconditional readiness poll adds a 100-ms quantization delay and
+		// changes the measured execution path.
+		if err := waitForTCP(ctx, functionEndpoint, functionReadyTimeout); err != nil {
+			log.Errorf("function readiness check failed for VM %s: %v", vmId, err)
+			if stopErr := orch.StopSingleVM(ctx, vmId); stopErr != nil {
+				log.Errorf("failed to stop unready VM %s: %v", vmId, stopErr)
+			}
+			http.Error(w, fmt.Sprintf("Function Readiness Error: %v", err), http.StatusServiceUnavailable)
+			return
+		}
+		log.Debugf("function endpoint %s is ready", functionEndpoint)
+
 		mu.Lock()
 		relayPort++
 		port := 50000 + relayPort%5000
