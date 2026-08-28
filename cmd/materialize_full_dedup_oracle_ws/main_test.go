@@ -106,3 +106,27 @@ func TestParseHashIndexedSource(t *testing.T) {
 		t.Fatal("accepted a hash/content mismatch")
 	}
 }
+
+func TestParseBatchWorkloads(t *testing.T) {
+	fixture := []byte(`{"workloads":[
+		{"profile":"one","snapshot":"cold-one-0","image_inventory":"image-one"},
+		{"profile":"two","snapshot":"cold-two-0","image_inventory":"image-two"}
+	]}`)
+	got, err := parseBatchWorkloads(fixture)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 2 || got[1].Snapshot != "cold-two-0" {
+		t.Fatalf("parseBatchWorkloads() = %#v", got)
+	}
+
+	for _, invalid := range [][]byte{
+		[]byte(`{"workloads":[]}`),
+		[]byte(`{"workloads":[{"profile":"one","snapshot":"same","image_inventory":"image"},{"profile":"two","snapshot":"same","image_inventory":"image"}]}`),
+		[]byte(`{"workloads":[{"profile":"one","snapshot":"snapshot"}]}`),
+	} {
+		if _, err := parseBatchWorkloads(invalid); err == nil {
+			t.Fatalf("accepted invalid batch manifest %s", invalid)
+		}
+	}
+}

@@ -63,6 +63,54 @@ type report struct {
 	CoveredWorkingSetPages    int    `json:"covered_working_set_pages,omitempty"`
 }
 
+type batchWorkload struct {
+	Profile        string `json:"profile"`
+	Snapshot       string `json:"snapshot"`
+	ImageInventory string `json:"image_inventory"`
+}
+
+type batchWorkloadFile struct {
+	Workloads []batchWorkload `json:"workloads"`
+}
+
+type batchRevisionReport struct {
+	Profile                 string `json:"profile"`
+	Snapshot                string `json:"snapshot"`
+	ReferenceImageKey       string `json:"reference_image_key"`
+	RecipeReferences        int    `json:"recipe_references"`
+	RecipeUniqueHashes      int    `json:"recipe_unique_hashes"`
+	WorkingSetPages         int    `json:"working_set_pages"`
+	WorkingSetUniqueHashes  int    `json:"working_set_unique_hashes"`
+	SharedBaseHashes        int    `json:"shared_base_hashes"`
+	SharedImageHashes       int    `json:"shared_image_hashes"`
+	PrivateWorkingSetPages  int    `json:"private_working_set_pages"`
+	CoveredWorkingSetPages  int    `json:"covered_working_set_pages"`
+	PrivateRawBytes         int    `json:"private_raw_bytes"`
+	PrivateCompressedBytes  int    `json:"private_compressed_bytes"`
+	PrivateCompressedFrames int    `json:"private_compressed_frames"`
+}
+
+type batchReport struct {
+	Method                    string                `json:"method"`
+	TimingBoundary            string                `json:"timing_boundary"`
+	VerificationScope         string                `json:"verification_scope"`
+	ReferenceEndpoint         string                `json:"reference_endpoint"`
+	SemanticRevisions         int                   `json:"semantic_revisions"`
+	CanonicalPageObjects      int                   `json:"canonical_page_objects"`
+	VerifiedUniquePageObjects int                   `json:"verified_unique_page_objects"`
+	RecipeReferences          int                   `json:"recipe_references"`
+	RecipeUniqueHashes        int                   `json:"recipe_unique_hashes"`
+	WorkingSetReferences      int                   `json:"working_set_references"`
+	WorkingSetUniqueHashes    int                   `json:"working_set_unique_hashes"`
+	Revisions                 []batchRevisionReport `json:"revisions"`
+}
+
+type loadedBatchRevision struct {
+	workload     batchWorkload
+	recipeHashes []string
+	pfns         []int
+}
+
 type pageResult struct {
 	hash string
 	data []byte
@@ -394,10 +442,173 @@ func validateSplitSnapView(
 	}, nil
 }
 
+func parseBatchWorkloads(data []byte) ([]batchWorkload, error) {
+	var config batchWorkloadFile
+	if err := json.Unmarshal(data, &config); err != nil {
+		return nil, fmt.Errorf("parse workload manifest: %w", err)
+	}
+	if len(config.Workloads) == 0 {
+		return nil, fmt.Errorf("workload manifest is empty")
+	}
+	seenProfiles := make(map[string]struct{}, len(config.Workloads))
+	seenSnapshots := make(map[string]struct{}, len(config.Workloads))
+	for index, workload := range config.Workloads {
+		if strings.TrimSpace(workload.Profile) == "" || strings.TrimSpace(workload.Snapshot) == "" || strings.TrimSpace(workload.ImageInventory) == "" {
+			return nil, fmt.Errorf("workload %d requires profile, snapshot, and image_inventory", index)
+		}
+		if _, duplicate := seenProfiles[workload.Profile]; duplicate {
+			return nil, fmt.Errorf("duplicate profile %s", workload.Profile)
+		}
+		if _, duplicate := seenSnapshots[workload.Snapshot]; duplicate {
+			return nil, fmt.Errorf("duplicate semantic snapshot %s", workload.Snapshot)
+		}
+		seenProfiles[workload.Profile] = struct{}{}
+		seenSnapshots[workload.Snapshot] = struct{}{}
+	}
+	return config.Workloads, nil
+}
+
+func sortedSetKeys(values map[string]struct{}) []string {
+	result := make([]string, 0, len(values))
+	for value := range values {
+		result = append(result, value)
+	}
+	sort.Strings(result)
+	return result
+}
+
+func writeJSONReport(value any, reportPath string) error {
+	data, err := json.MarshalIndent(value, "", "  ")
+	if err != nil {
+		return fmt.Errorf("marshal report: %w", err)
+	}
+	if reportPath != "" {
+		if err := os.WriteFile(reportPath, append(data, '\n'), 0644); err != nil {
+			return fmt.Errorf("write report: %w", err)
+		}
+	}
+	fmt.Println(string(data))
+	return nil
+}
+
+func validateBatch(
+	store, reference *storage.MinioStorage,
+	workloads []batchWorkload,
+	workers int,
+	verificationScope string,
+) (batchReport, error) {
+	loaded := make([]loadedBatchRevision, 0, len(workloads))
+	allRecipeHashes := make(map[string]struct{})
+	allWorkingSetHashes := make(map[string]struct{})
+	recipeReferences := 0
+	workingSetReferences := 0
+	for _, workload := range workloads {
+		recipeData, err := store.DownloadObject(workload.Snapshot + "/recipe_file")
+		if err != nil {
+			return batchReport{}, fmt.Errorf("download %s recipe: %w", workload.Snapshot, err)
+		}
+		recipeHashes, err := parseRecipe(recipeData)
+		if err != nil {
+			return batchReport{}, fmt.Errorf("parse %s recipe: %w", workload.Snapshot, err)
+		}
+		wsData, err := store.DownloadObject(workload.Snapshot + "/working_set_pages")
+		if err != nil {
+			return batchReport{}, fmt.Errorf("download %s working set: %w", workload.Snapshot, err)
+		}
+		pfns, err := parseWorkingSetPFNs(wsData, len(recipeHashes))
+		if err != nil {
+			return batchReport{}, fmt.Errorf("parse %s working set: %w", workload.Snapshot, err)
+		}
+		for _, hash := range recipeHashes {
+			allRecipeHashes[hash] = struct{}{}
+		}
+		for _, pfn := range pfns {
+			allWorkingSetHashes[recipeHashes[pfn]] = struct{}{}
+		}
+		recipeReferences += len(recipeHashes)
+		workingSetReferences += len(pfns)
+		loaded = append(loaded, loadedBatchRevision{workload: workload, recipeHashes: recipeHashes, pfns: pfns})
+	}
+
+	pageObjectKeys, err := store.ListObjects("_chunks/", true)
+	if err != nil {
+		return batchReport{}, fmt.Errorf("list canonical page store: %w", err)
+	}
+	allCanonicalHashes, canonicalSet, err := canonicalHashes(pageObjectKeys)
+	if err != nil {
+		return batchReport{}, err
+	}
+	for hash := range allRecipeHashes {
+		if _, exists := canonicalSet[hash]; !exists {
+			return batchReport{}, fmt.Errorf("recipe hash %s is absent from the canonical page store", hash)
+		}
+	}
+	hashesToVerify := allCanonicalHashes
+	if verificationScope == "working-set" {
+		hashesToVerify = sortedSetKeys(allWorkingSetHashes)
+	}
+	pageByHash, err := verifyAndCollect(store, hashesToVerify, allWorkingSetHashes, workers)
+	if err != nil {
+		return batchReport{}, fmt.Errorf("verify canonical page store: %w", err)
+	}
+
+	revisions := make([]batchRevisionReport, 0, len(loaded))
+	for _, revision := range loaded {
+		view, err := validateSplitSnapView(
+			reference,
+			revision.workload.Snapshot,
+			revision.workload.ImageInventory,
+			revision.recipeHashes,
+			revision.pfns,
+			pageByHash,
+			workers,
+		)
+		if err != nil {
+			return batchReport{}, fmt.Errorf("validate %s against SplitSnap: %w", revision.workload.Snapshot, err)
+		}
+		wanted := make(map[string]struct{}, len(revision.pfns))
+		for _, pfn := range revision.pfns {
+			wanted[revision.recipeHashes[pfn]] = struct{}{}
+		}
+		revisions = append(revisions, batchRevisionReport{
+			Profile:                 revision.workload.Profile,
+			Snapshot:                revision.workload.Snapshot,
+			ReferenceImageKey:       revision.workload.ImageInventory,
+			RecipeReferences:        len(revision.recipeHashes),
+			RecipeUniqueHashes:      len(uniqueSorted(revision.recipeHashes)),
+			WorkingSetPages:         len(revision.pfns),
+			WorkingSetUniqueHashes:  len(wanted),
+			SharedBaseHashes:        view.baseHashes,
+			SharedImageHashes:       view.imageHashes,
+			PrivateWorkingSetPages:  view.privatePages,
+			CoveredWorkingSetPages:  view.coveredPages,
+			PrivateRawBytes:         view.privateRawBytes,
+			PrivateCompressedBytes:  view.privateCompBytes,
+			PrivateCompressedFrames: view.privateFrames,
+		})
+	}
+
+	return batchReport{
+		Method:                    "unsafe Full Dedup oracle inside the SplitSnap framework across an explicit workload/revision manifest; persistent pages use global raw-content keys and every accepted SplitSnap transfer view is content-validated",
+		TimingBoundary:            "SplitSnap-format transfer-view assembly and temporary footprint are excluded; measured restore starts after the view exists",
+		VerificationScope:         verificationScope,
+		SemanticRevisions:         len(revisions),
+		CanonicalPageObjects:      len(allCanonicalHashes),
+		VerifiedUniquePageObjects: len(hashesToVerify),
+		RecipeReferences:          recipeReferences,
+		RecipeUniqueHashes:        len(allRecipeHashes),
+		WorkingSetReferences:      workingSetReferences,
+		WorkingSetUniqueHashes:    len(allWorkingSetHashes),
+		Revisions:                 revisions,
+	}, nil
+}
+
 func main() {
 	minioURL := flag.String("minioURL", "127.0.0.1:9000", "MinIO endpoint")
 	referenceMinioURL := flag.String("referenceMinioURL", "", "accepted SplitSnap MinIO endpoint used to validate the transient restore view")
 	referenceImageKey := flag.String("referenceImageKey", "aes-go", "SplitSnap ws_shared image key")
+	batchWorkloadsPath := flag.String("batchWorkloads", "", "optional JSON manifest for validating all workload/revision transfer views in one pass")
+	verificationScope := flag.String("verifyCanonical", "all", "canonical content verification scope for batch mode: all or working-set")
 	accessKey := flag.String("minioAccessKey", "minio", "MinIO access key")
 	secretKey := flag.String("minioSecretKey", "minio123", "MinIO secret key")
 	bucket := flag.String("bucket", "snapshots", "MinIO bucket")
@@ -409,8 +620,16 @@ func main() {
 	overwrite := flag.Bool("overwrite", false, "replace an existing transient WS view")
 	flag.Parse()
 
-	if strings.TrimSpace(*snapshot) == "" {
+	if *verificationScope != "all" && *verificationScope != "working-set" {
+		fmt.Fprintln(os.Stderr, "verifyCanonical must be all or working-set")
+		os.Exit(2)
+	}
+	if strings.TrimSpace(*snapshot) == "" && strings.TrimSpace(*batchWorkloadsPath) == "" {
 		fmt.Fprintln(os.Stderr, "-snapshot is required")
+		os.Exit(2)
+	}
+	if strings.TrimSpace(*snapshot) != "" && strings.TrimSpace(*batchWorkloadsPath) != "" {
+		fmt.Fprintln(os.Stderr, "-snapshot and -batchWorkloads are mutually exclusive")
 		os.Exit(2)
 	}
 	if *workers < 1 || *frameSize < pageSize || *frameSize%pageSize != 0 {
@@ -430,6 +649,50 @@ func main() {
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "open object store: %v\n", err)
 		os.Exit(1)
+	}
+	if strings.TrimSpace(*batchWorkloadsPath) != "" {
+		if strings.TrimSpace(*referenceMinioURL) == "" {
+			fmt.Fprintln(os.Stderr, "-referenceMinioURL is required with -batchWorkloads")
+			os.Exit(2)
+		}
+		if *overwrite {
+			fmt.Fprintln(os.Stderr, "-overwrite is invalid in read-only batch validation mode")
+			os.Exit(2)
+		}
+		manifestData, readErr := os.ReadFile(*batchWorkloadsPath)
+		if readErr != nil {
+			fmt.Fprintf(os.Stderr, "read workload manifest: %v\n", readErr)
+			os.Exit(1)
+		}
+		workloads, parseErr := parseBatchWorkloads(manifestData)
+		if parseErr != nil {
+			fmt.Fprintln(os.Stderr, parseErr)
+			os.Exit(1)
+		}
+		referenceClient, clientErr := minio.New(*referenceMinioURL, &minio.Options{
+			Creds:  credentials.NewStaticV4(*accessKey, *secretKey, ""),
+			Secure: false,
+		})
+		if clientErr != nil {
+			fmt.Fprintf(os.Stderr, "create SplitSnap reference client: %v\n", clientErr)
+			os.Exit(1)
+		}
+		referenceStore, storeErr := storage.NewMinioStorage(referenceClient, *bucket)
+		if storeErr != nil {
+			fmt.Fprintf(os.Stderr, "open SplitSnap reference store: %v\n", storeErr)
+			os.Exit(1)
+		}
+		result, validateErr := validateBatch(store, referenceStore, workloads, *workers, *verificationScope)
+		if validateErr != nil {
+			fmt.Fprintln(os.Stderr, validateErr)
+			os.Exit(1)
+		}
+		result.ReferenceEndpoint = *referenceMinioURL
+		if writeErr := writeJSONReport(result, *reportPath); writeErr != nil {
+			fmt.Fprintln(os.Stderr, writeErr)
+			os.Exit(1)
+		}
+		return
 	}
 
 	payloadObject := fmt.Sprintf("%s/working_set_pages_content.zstd.frames", *snapshot)
