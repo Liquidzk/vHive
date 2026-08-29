@@ -69,6 +69,28 @@ func TestWaitForTCPTimeout(t *testing.T) {
 	}
 }
 
+func TestAllocateLoopbackEndpoint(t *testing.T) {
+	occupied, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen on occupied endpoint: %v", err)
+	}
+	defer occupied.Close()
+
+	endpoint, err := allocateLoopbackEndpoint()
+	if err != nil {
+		t.Fatalf("allocateLoopbackEndpoint: %v", err)
+	}
+	if endpoint == occupied.Addr().String() {
+		t.Fatalf("allocated occupied endpoint %s", endpoint)
+	}
+
+	listener, err := net.Listen("tcp", endpoint)
+	if err != nil {
+		t.Fatalf("allocated endpoint %s is not bindable: %v", endpoint, err)
+	}
+	listener.Close()
+}
+
 func TestGRPCStatus(t *testing.T) {
 	tests := []struct {
 		name   string

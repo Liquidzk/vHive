@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/tls"
 	"encoding/json"
@@ -37,7 +38,6 @@ var (
 	orch       *ctriface.Orchestrator
 	snapMgr    *snapshotting.SnapshotManager
 	imageMap   map[string]string
-	relayPort  = 0
 	mu         = &sync.Mutex{}
 	cleaning   *bool
 	baseSnap   *bool
@@ -70,6 +70,24 @@ func waitForTCP(ctx context.Context, address string, timeout time.Duration) erro
 		case <-time.After(readyRetryInterval):
 		}
 	}
+}
+
+// allocateLoopbackEndpoint asks the kernel for a currently unused loopback
+// port. The listener is closed immediately before the auxiliary relay is
+// started. Callers serialize allocation and process start with mu so two
+// concurrent requests in this relay cannot select the same endpoint during
+// that short hand-off window.
+func allocateLoopbackEndpoint() (string, error) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		return "", fmt.Errorf("allocate auxiliary relay endpoint: %w", err)
+	}
+
+	endpoint := listener.Addr().String()
+	if err := listener.Close(); err != nil {
+		return "", fmt.Errorf("release auxiliary relay endpoint %s: %w", endpoint, err)
+	}
+	return endpoint, nil
 }
 
 func functionEndpointPort(relayArgs string) (string, error) {
@@ -254,29 +272,51 @@ func handler(w http.ResponseWriter, r *http.Request) {
 		}
 		log.Debugf("function endpoint %s is ready", functionEndpoint)
 
+		// The outer relay is restarted for every formal-evaluation point. A
+		// process-local counter therefore reused ports 50001..50060 across
+		// points and could collide with an auxiliary relay that was still
+		// exiting. Ask the kernel for a currently free port instead, and keep
+		// selection plus process start serialized until the child has inherited
+		// its arguments.
 		mu.Lock()
-		relayPort++
-		port := 50000 + relayPort%5000
-		mu.Unlock()
+		endpoint, err = allocateLoopbackEndpoint()
+		if err != nil {
+			mu.Unlock()
+			log.Errorf("failed to allocate auxiliary relay endpoint for VM %s: %v", vmId, err)
+			if stopErr := orch.StopSingleVM(ctx, vmId); stopErr != nil {
+				log.Errorf("failed to stop VM %s after relay endpoint allocation failure: %v", vmId, stopErr)
+			}
+			http.Error(w, fmt.Sprintf("Relay Endpoint Error: %v", err), http.StatusServiceUnavailable)
+			return
+		}
 
-		endpoint = fmt.Sprintf("localhost:%d", port)
 		relayArgs = strings.Replace(relayArgs, "--addr=0.0.0.0:50000", "--addr="+endpoint, 1)
 		relayArgs = strings.Replace(relayArgs, "--function-endpoint-url=0.0.0.0", "--function-endpoint-url="+resp.GuestIP, 1)
 		log.Debugf("Relay args: %s", relayArgs)
 
+		cmd := exec.CommandContext(
+			relayCtx,
+			homeDir+"/vswarm/tools/relay/server",
+			strings.Split(relayArgs, " ")...,
+		)
+		var relayOutput bytes.Buffer
+		cmd.Stdout = &relayOutput
+		cmd.Stderr = &relayOutput
+		startErr := cmd.Start()
+		mu.Unlock()
+		if startErr != nil {
+			log.Errorf("failed to start auxiliary relay for VM %s at %s: %v", vmId, endpoint, startErr)
+			if stopErr := orch.StopSingleVM(ctx, vmId); stopErr != nil {
+				log.Errorf("failed to stop VM %s after relay start failure: %v", vmId, stopErr)
+			}
+			http.Error(w, fmt.Sprintf("Relay Start Error: %v", startErr), http.StatusServiceUnavailable)
+			return
+		}
 		go func() {
-			cmd := exec.CommandContext(
-				relayCtx,
-				homeDir+"/vswarm/tools/relay/server",
-				strings.Split(relayArgs, " ")...,
-			)
-
-			out, err := cmd.CombinedOutput()
-
-			log.Debugf("vswarm relay output:\n%s\n", out)
-
-			if err != nil {
-				fmt.Printf("vswarm relay error: %v\n", err)
+			waitErr := cmd.Wait()
+			log.Debugf("vswarm relay output:\n%s\n", relayOutput.String())
+			if waitErr != nil {
+				fmt.Printf("vswarm relay error: %v\n", waitErr)
 			}
 		}()
 
