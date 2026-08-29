@@ -1142,8 +1142,9 @@ func (o *Orchestrator) LoadSnapshot(ctx context.Context, snap *snapshotting.Snap
 				loadSnapshotMetric.MetricMap[metrics.GetWorkingSetContent] = metrics.ToUS(time.Since(tStart))
 			}
 		}
+		uffdReady := make(chan error, 1)
 		go func() {
-			err := uffd_handler.StartUffdHandler(fmt.Sprintf("/tmp/%s.uffd.sock", vmID), memData, memPathForTrace+".touched", wsPages, wsContent, wsContentSources, o.isLazyMode, o.snapshotManager, o.threads, releaseAll)
+			err := uffd_handler.StartUffdHandler(fmt.Sprintf("/tmp/%s.uffd.sock", vmID), memData, memPathForTrace+".touched", wsPages, wsContent, wsContentSources, o.isLazyMode, o.snapshotManager, o.threads, releaseAll, uffdReady)
 			if err != nil {
 				logger.Error("Failed to start UFFD handler: ", err)
 			} else if o.isWSRecording && snap.GetId() != "base" {
@@ -1159,7 +1160,9 @@ func (o *Orchestrator) LoadSnapshot(ctx context.Context, snap *snapshotting.Snap
 				}
 			}
 		}()
-		// time.Sleep(time.Second)
+		if err := <-uffdReady; err != nil {
+			return nil, nil, errors.Wrap(err, "starting UFFD listener")
+		}
 	} else {
 		conf.MemBackend = &proto.MemoryBackend{
 			BackendType: "File",

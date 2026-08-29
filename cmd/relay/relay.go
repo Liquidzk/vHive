@@ -181,6 +181,11 @@ func handler(w http.ResponseWriter, r *http.Request) {
 	if snap, err = snapMgr.AcquireSnapshot(rev); err == nil { // local case
 		log.Debugf("Using snapshot for rev %s", rev)
 		resp, metric, err = orch.LoadSnapshot(ctx, snap, false, false)
+		if err != nil || metric == nil {
+			log.Errorf("LoadSnapshot error is %v; metric: %p", err, metric)
+			http.Error(w, fmt.Sprintf("Snapshot Load Error, metric: %p", metric), http.StatusInternalServerError)
+			return
+		}
 		log.Debugf("Loaded snapshot for rev %s in %v", rev, metric.Total())
 		metric.PrintAll()
 	} else if ok, err = snapMgr.SnapshotExists(rev); err == nil && ok { // remote case
@@ -203,6 +208,12 @@ func handler(w http.ResponseWriter, r *http.Request) {
 		if err != nil {
 			log.Errorf("LoadSnapshot error is %v", err)
 			http.Error(w, fmt.Sprintf("Snapshot Load Error, metric: %p", metric), http.StatusInternalServerError)
+			return
+		}
+		if metric == nil {
+			log.Error("LoadSnapshot returned a nil metric without an error")
+			http.Error(w, "Snapshot Load Error, nil metric", http.StatusInternalServerError)
+			return
 		}
 		log.Debugf("Snapshot Load Result: metric: %p", metric)
 		log.Debugf("Loaded snapshot for rev %s in %v", rev, metric.Total())

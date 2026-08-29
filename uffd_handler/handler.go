@@ -1088,7 +1088,7 @@ func tryGetMappingsAndFile(conn *net.UnixConn) (string, int, error) {
 	return body, -1, nil
 }
 
-func StartUffdHandler(uffdSockPath string, memData []byte, traceFilePath string, wsData []byte, wsContent []byte, wsSources *snapshotting.WorkingSetContentSources, lazy bool, snapMgr *snapshotting.SnapshotManager, threads int, release func()) error {
+func StartUffdHandler(uffdSockPath string, memData []byte, traceFilePath string, wsData []byte, wsContent []byte, wsSources *snapshotting.WorkingSetContentSources, lazy bool, snapMgr *snapshotting.SnapshotManager, threads int, release func(), ready chan<- error) error {
 	log.Debugf("Starting handler at %s", uffdSockPath)
 	if release != nil {
 		defer release()
@@ -1097,9 +1097,15 @@ func StartUffdHandler(uffdSockPath string, memData []byte, traceFilePath string,
 	// Create and bind Unix domain socket
 	listener, err := net.ListenUnix("unix", &net.UnixAddr{Name: uffdSockPath, Net: "unix"})
 	if err != nil {
+		if ready != nil {
+			ready <- err
+		}
 		return fmt.Errorf("cannot bind to socket path: %w", err)
 	}
 	log.Debugf("opened the listener at %s", uffdSockPath)
+	if ready != nil {
+		ready <- nil
+	}
 	defer listener.Close()
 
 	// Accept connection from Firecracker
