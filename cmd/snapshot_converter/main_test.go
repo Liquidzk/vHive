@@ -1,6 +1,8 @@
 package main
 
 import (
+	"os"
+	"path/filepath"
 	"reflect"
 	"testing"
 )
@@ -29,5 +31,29 @@ func TestSelectRevisionsForProcessing(t *testing.T) {
 	}
 	if !reflect.DeepEqual(representatives, wantRepresentatives) {
 		t.Fatalf("representatives mismatch: got %v want %v", representatives, wantRepresentatives)
+	}
+}
+
+func TestLoadRevisionAllowlist(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "revisions.txt")
+	if err := os.WriteFile(path, []byte("# tier\naes-go-1\nvideo-processing-2\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	got, err := loadRevisionAllowlist(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := map[string]bool{"aes-go-1": true, "video-processing-2": true}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("allowlist mismatch: got %v want %v", got, want)
+	}
+
+	for _, contents := range []string{"", "revision\nrevision\n", "bad/revision\n"} {
+		if err := os.WriteFile(path, []byte(contents), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := loadRevisionAllowlist(path); err == nil {
+			t.Fatalf("loadRevisionAllowlist(%q) unexpectedly succeeded", contents)
+		}
 	}
 }

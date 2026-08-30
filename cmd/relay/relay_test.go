@@ -4,9 +4,47 @@ import (
 	"context"
 	"net"
 	"net/http"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 )
+
+func TestLoadVMMemSizeMap(t *testing.T) {
+	t.Run("empty path disables mapping", func(t *testing.T) {
+		got, err := loadVMMemSizeMap("")
+		if err != nil || got != nil {
+			t.Fatalf("loadVMMemSizeMap empty = %#v, %v; want nil, nil", got, err)
+		}
+	})
+
+	t.Run("valid map", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "memory.json")
+		if err := os.WriteFile(path, []byte(`{"aes-go-1":512,"video-analytics-1":4096}`), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		got, err := loadVMMemSizeMap(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got["aes-go-1"] != 512 || got["video-analytics-1"] != 4096 || len(got) != 2 {
+			t.Fatalf("unexpected VM memory map: %#v", got)
+		}
+	})
+
+	for _, contents := range []string{`{}`, `{"revision":0}`, `{"":512}`, `[]`} {
+		contents := contents
+		t.Run("reject_"+contents, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "memory.json")
+			if err := os.WriteFile(path, []byte(contents), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := loadVMMemSizeMap(path); err == nil {
+				t.Fatalf("loadVMMemSizeMap(%s) unexpectedly succeeded", contents)
+			}
+		})
+	}
+}
 
 func TestFunctionEndpointPort(t *testing.T) {
 	tests := []struct {

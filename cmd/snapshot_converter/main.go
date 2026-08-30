@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
@@ -61,6 +62,34 @@ func selectRevisionsForProcessing(revisions map[string]bool, allRevisions bool) 
 	}
 	sort.Strings(selected)
 	return selected
+}
+
+func loadRevisionAllowlist(path string) (map[string]bool, error) {
+	if path == "" {
+		return nil, nil
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("read revision allowlist: %w", err)
+	}
+	allowlist := make(map[string]bool)
+	for _, line := range strings.Split(string(data), "\n") {
+		revision := strings.TrimSpace(line)
+		if revision == "" || strings.HasPrefix(revision, "#") {
+			continue
+		}
+		if strings.ContainsAny(revision, " \t/") {
+			return nil, fmt.Errorf("invalid revision %q in allowlist", revision)
+		}
+		if allowlist[revision] {
+			return nil, fmt.Errorf("duplicate revision %q in allowlist", revision)
+		}
+		allowlist[revision] = true
+	}
+	if len(allowlist) == 0 {
+		return nil, fmt.Errorf("revision allowlist is empty")
+	}
+	return allowlist, nil
 }
 
 // A lazy DownloadSnapshot deliberately skips the memory recipe because the
@@ -151,6 +180,8 @@ func main() {
 	chunkSize := flag.Uint64("chunkSize", 4096, "Chunk size for chunking")
 	workers := flag.Int("workers", runtime.NumCPU(), "Number of concurrent snapshot workers")
 	allRevisions := flag.Bool("allRevisions", false, "Process every snapshot revision instead of one representative per function type")
+	baseRevision := flag.String("baseRevision", "base", "Snapshot revision to use for base-page classification")
+	revisionAllowlistPath := flag.String("revisionAllowlist", "", "Optional newline-delimited exact revisions to process")
 	serviceFanOut := flag.Bool("serviceFanOut", true, "Copy converted representative snapshots to matching Knative services")
 	flag.Parse()
 
@@ -188,6 +219,16 @@ func main() {
 	if *workers < 1 {
 		*workers = 1
 	}
+	if strings.TrimSpace(*baseRevision) == "" || strings.ContainsAny(*baseRevision, " \t/") {
+		log.Fatalf("Invalid baseRevision %q", *baseRevision)
+	}
+	revisionAllowlist, err := loadRevisionAllowlist(*revisionAllowlistPath)
+	if err != nil {
+		log.Fatalf("Invalid revisionAllowlist: %v", err)
+	}
+	if len(revisionAllowlist) > 0 && !*allRevisions {
+		log.Fatal("-revisionAllowlist requires -allRevisions")
+	}
 
 	// Initialize SnapshotManager to load chunk info
 	smBase := filepath.Join(*baseDir, "snapshots")
@@ -214,18 +255,18 @@ func main() {
 		// like every revision recipe below.  Re-running the security rewrite here
 		// would salt private base hashes a second time and make the Raw and Zstd
 		// corpora semantically different.
-		baseEnsureErr = mgr.EnsureRemoteSnapshotChunkRepresentation("base")
+		baseEnsureErr = mgr.EnsureRemoteSnapshotChunkRepresentation(*baseRevision)
 	} else {
-		baseEnsureErr = mgr.EnsureRemoteSnapshotChunked("base")
+		baseEnsureErr = mgr.EnsureRemoteSnapshotChunked(*baseRevision)
 	}
 	if baseEnsureErr != nil {
 		log.Fatalf("Failed to convert base snapshot: %v", baseEnsureErr)
 	}
-	if _, err := mgr.DownloadSnapshot("base"); err != nil {
+	if _, err := mgr.DownloadSnapshot(*baseRevision); err != nil {
 		log.Warnf("Failed to download base snapshot metadata: %v", err)
 		log.Warn("Continuing without base-snapshot chunk classification")
 	} else {
-		mgr.PrepareBaseSnapshotChunks()
+		mgr.PrepareBaseSnapshotChunksForRevision(*baseRevision)
 	}
 
 	log.Info("Snapshot manager initialized.")
@@ -241,7 +282,7 @@ func main() {
 		parts := strings.Split(path, "/")
 		if len(parts) > 1 {
 			rev := parts[0]
-			if !strings.HasPrefix(rev, "_chunks") && rev != "ws_shared" && rev != "" && rev != "base" {
+			if !strings.HasPrefix(rev, "_chunks") && rev != "ws_shared" && rev != "" && rev != *baseRevision {
 				snapshots[rev] = true
 			}
 		}
@@ -249,6 +290,17 @@ func main() {
 
 	log.Infof("Found %d snapshots to process", len(snapshots))
 	selectedRevisions := selectRevisionsForProcessing(snapshots, *allRevisions)
+	if len(revisionAllowlist) > 0 {
+		selectedRevisions = selectedRevisions[:0]
+		for revision := range revisionAllowlist {
+			if !snapshots[revision] {
+				log.Fatalf("Allowlisted snapshot revision %s is missing", revision)
+			}
+			selectedRevisions = append(selectedRevisions, revision)
+		}
+		sort.Strings(selectedRevisions)
+		log.Infof("Restricted conversion to %d allowlisted revisions with base %s", len(selectedRevisions), *baseRevision)
+	}
 	if *allRevisions {
 		log.Infof("Processing all %d snapshot revisions", len(selectedRevisions))
 	} else {

@@ -1142,6 +1142,14 @@ func (mgr *SnapshotManager) WaitForInit() {
 }
 
 func (mgr *SnapshotManager) PrepareBaseSnapshotChunks() {
+	mgr.PrepareBaseSnapshotChunksForRevision("base")
+}
+
+// PrepareBaseSnapshotChunksForRevision classifies chunks against an explicit
+// base revision. This is required when one immutable corpus contains snapshots
+// created with more than one VM-memory tier and therefore more than one base.
+// Callers must use a fresh process/manager when switching base revisions.
+func (mgr *SnapshotManager) PrepareBaseSnapshotChunksForRevision(revision string) {
 	if len(baseSnapChunks) > 0 {
 		return
 	}
@@ -1150,12 +1158,15 @@ func (mgr *SnapshotManager) PrepareBaseSnapshotChunks() {
 	}
 
 	baseSnapChunks = make(map[[16]byte]bool)
-	baseSnap, err := os.Open(mgr.snapshots["base"].GetRecipeFilePath())
+	base, ok := mgr.snapshots[revision]
+	if !ok {
+		log.Errorf("base snapshot revision %s is not loaded", revision)
+		return
+	}
+	baseSnap, err := os.Open(base.GetRecipeFilePath())
 	if err != nil {
-		if base, ok := mgr.snapshots["base"]; ok {
-			_ = mgr.uploadMemFile(base)
-		}
-		log.Errorf("failed to open base snapshot recipe file: %v", err)
+		_ = mgr.uploadMemFile(base)
+		log.Errorf("failed to open base snapshot recipe file for %s: %v", revision, err)
 		return
 	}
 	defer baseSnap.Close()
@@ -1178,7 +1189,7 @@ func (mgr *SnapshotManager) PrepareBaseSnapshotChunks() {
 		baseSnapChunks[hash] = true
 	}
 
-	log.Debugf("Base snapshot chunk hashes updated, total %d chunks", len(baseSnapChunks))
+	log.Debugf("Base snapshot chunk hashes updated for %s, total %d chunks", revision, len(baseSnapChunks))
 }
 
 func (mgr *SnapshotManager) WriteHitStatsToCSV(filePath string) error {

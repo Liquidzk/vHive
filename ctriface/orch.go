@@ -318,28 +318,29 @@ type Orchestrator struct {
 	snapshotManager   *snapshotting.SnapshotManager
 	dockerCredentials DockerCredentials
 	// store *skv.KVStore
-	snapshotMode      string
-	cacheSnaps        bool
-	isUPFEnabled      bool
-	isLazyMode        bool
-	isWSPulling       bool
-	isWSCoalescing    bool
-	isWSRecording     bool
-	isChunkingEnabled bool
-	chunkSize         uint64
-	snapshotsDir      string
-	snapshotsStorage  string
-	snapshotsBucket   string
-	baseSnap          bool
-	isMetricsMode     bool
-	netPoolSize       int
-	shimPoolSize      int
-	cacheSize         uint64
-	threads           int
-	encryption        bool
-	cleanChunks       bool
-	vmMemSizeMib      uint32
-	dns               []string
+	snapshotMode        string
+	cacheSnaps          bool
+	isUPFEnabled        bool
+	isLazyMode          bool
+	isWSPulling         bool
+	isWSCoalescing      bool
+	isWSRecording       bool
+	isChunkingEnabled   bool
+	chunkSize           uint64
+	snapshotsDir        string
+	snapshotsStorage    string
+	snapshotsBucket     string
+	baseSnap            bool
+	isMetricsMode       bool
+	netPoolSize         int
+	shimPoolSize        int
+	cacheSize           uint64
+	threads             int
+	encryption          bool
+	cleanChunks         bool
+	vmMemSizeMib        uint32
+	vmMemSizeBySnapshot map[string]uint32
+	dns                 []string
 
 	vethPrefix  string
 	clonePrefix string

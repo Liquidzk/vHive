@@ -144,6 +144,22 @@ func WithVMMemSizeMib(vmMemSizeMib uint32) OrchestratorOption {
 	}
 }
 
+// WithVMMemSizeBySnapshot configures exact VM memory sizes for pre-existing
+// snapshot revisions. The map is copied so callers cannot mutate a running
+// orchestrator's restore configuration.
+func WithVMMemSizeBySnapshot(vmMemSizeBySnapshot map[string]uint32) OrchestratorOption {
+	return func(o *Orchestrator) {
+		if len(vmMemSizeBySnapshot) == 0 {
+			o.vmMemSizeBySnapshot = nil
+			return
+		}
+		o.vmMemSizeBySnapshot = make(map[string]uint32, len(vmMemSizeBySnapshot))
+		for revision, vmMemSizeMib := range vmMemSizeBySnapshot {
+			o.vmMemSizeBySnapshot[revision] = vmMemSizeMib
+		}
+	}
+}
+
 func WithVethPrefix(vethPrefix string) OrchestratorOption {
 	return func(o *Orchestrator) {
 		o.vethPrefix = vethPrefix

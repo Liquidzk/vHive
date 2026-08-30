@@ -824,6 +824,20 @@ func (o *Orchestrator) getVMConfig(vm *misc.VM) *proto.CreateVMRequest {
 	}
 }
 
+func (o *Orchestrator) vmMemSizeForSnapshot(revision string) (uint32, error) {
+	if len(o.vmMemSizeBySnapshot) == 0 {
+		return o.vmMemSizeMib, nil
+	}
+	vmMemSizeMib, ok := o.vmMemSizeBySnapshot[revision]
+	if !ok {
+		return 0, errors.Errorf("missing VM memory size for snapshot revision %q", revision)
+	}
+	if vmMemSizeMib == 0 {
+		return 0, errors.Errorf("invalid zero VM memory size for snapshot revision %q", revision)
+	}
+	return vmMemSizeMib, nil
+}
+
 // StopActiveVMs Shuts down all active VMs
 func (o *Orchestrator) StopActiveVMs() error {
 	var vmGroup sync.WaitGroup
@@ -940,6 +954,13 @@ func (o *Orchestrator) LoadSnapshot(ctx context.Context, snap *snapshotting.Snap
 		loadErr, activateErr error
 		loadDone             = make(chan int)
 	)
+	if snap == nil {
+		return nil, nil, errors.New("ERROR: snap is nil")
+	}
+	vmMemSizeMib, err := o.vmMemSizeForSnapshot(snap.GetId())
+	if err != nil {
+		return nil, nil, err
+	}
 
 	// Acquire a VM ID from the shim pool
 	vmID, err := o.AcquireShimFromPool(ctx)
@@ -977,10 +998,8 @@ func (o *Orchestrator) LoadSnapshot(ctx context.Context, snap *snapshotting.Snap
 	}()
 
 	conf := o.getVMConfig(vm)
+	conf.MachineCfg.MemSizeMib = vmMemSizeMib
 	conf.LoadSnapshot = true
-	if snap == nil {
-		return nil, nil, errors.New("ERROR: snap is nil")
-	}
 	conf.SnapshotPath = snap.GetSnapshotFilePath()
 	conf.MemFilePath = snap.GetMemFilePath()
 	conf.EnableDiffSnapshots = enableDiffSnapshots

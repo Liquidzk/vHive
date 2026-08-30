@@ -35,13 +35,14 @@ var (
 )
 
 var (
-	orch       *ctriface.Orchestrator
-	snapMgr    *snapshotting.SnapshotManager
-	imageMap   map[string]string
-	mu         = &sync.Mutex{}
-	cleaning   *bool
-	baseSnap   *bool
-	dropCaches *bool
+	orch            *ctriface.Orchestrator
+	snapMgr         *snapshotting.SnapshotManager
+	imageMap        map[string]string
+	mu              = &sync.Mutex{}
+	cleaning        *bool
+	baseSnap        *bool
+	dropCaches      *bool
+	requireSnapshot *bool
 )
 
 const (
@@ -124,6 +125,32 @@ func functionEndpointPort(directPort, relayArgs string) (string, error) {
 		return parseFunctionPort(value, "--function-endpoint-port")
 	}
 	return defaultPort, nil
+}
+
+func loadVMMemSizeMap(path string) (map[string]uint32, error) {
+	if path == "" {
+		return nil, nil
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("read VM memory map: %w", err)
+	}
+	vmMemSizeBySnapshot := make(map[string]uint32)
+	if err := json.Unmarshal(data, &vmMemSizeBySnapshot); err != nil {
+		return nil, fmt.Errorf("parse VM memory map: %w", err)
+	}
+	if len(vmMemSizeBySnapshot) == 0 {
+		return nil, fmt.Errorf("VM memory map is empty")
+	}
+	for revision, vmMemSizeMib := range vmMemSizeBySnapshot {
+		if strings.TrimSpace(revision) == "" {
+			return nil, fmt.Errorf("VM memory map contains an empty revision")
+		}
+		if vmMemSizeMib == 0 {
+			return nil, fmt.Errorf("VM memory map contains zero MiB for revision %q", revision)
+		}
+	}
+	return vmMemSizeBySnapshot, nil
 }
 
 func grpcStatus(header http.Header) string {
@@ -246,6 +273,15 @@ func handler(w http.ResponseWriter, r *http.Request) {
 		log.Debugf("Snapshot Load Result: metric: %p", metric)
 		log.Debugf("Loaded snapshot for rev %s in %v", rev, metric.Total())
 		metric.PrintAll()
+	} else if *requireSnapshot {
+		if err != nil {
+			log.Errorf("Snapshot lookup failed for required revision %s: %v", rev, err)
+			http.Error(w, fmt.Sprintf("Required Snapshot Lookup Error: %v", err), http.StatusServiceUnavailable)
+		} else {
+			log.Errorf("Required snapshot is missing for revision %s", rev)
+			http.Error(w, fmt.Sprintf("Required Snapshot Missing: %s", rev), http.StatusServiceUnavailable)
+		}
+		return
 	} else if *baseSnap { // start from base snapshot case
 		log.Debugf("No snapshot for rev %s, starting from base snapshot", rev)
 		resp, err = orch.StartWithBaseSnapshot(ctx, image, envArr, argsArr)
@@ -415,6 +451,7 @@ func main() {
 	clonePrefix := flag.String("clonePrefix", "172.18", "Prefix for node-accessible IP addresses of uVMs, expected subnet is /16")
 	dnsNameservers := flag.String("dnsNameservers", "", "Comma-separated DNS nameservers for microVMs; empty uses Kubernetes DNS discovery with the existing fallback")
 	vmMemSizeMib := flag.Uint("vmMemSizeMib", 512, "Memory size in MiB for newly created microVMs")
+	vmMemSizeMapPath := flag.String("vmMemSizeMap", "", "JSON map from snapshot revision to VM memory size in MiB; mapped restores fail closed on missing entries")
 	dockerCredentials := flag.String("dockerCredentials", `{"docker-credentials":{"ghcr.io":{"username":"","password":""}}}`, "Docker credentials for pulling images from inside a microVM") // https://github.com/firecracker-microvm/firecracker-containerd/blob/main/docker-credential-mmds
 	minioCredentials := flag.String("minioCredentials", "10.0.1.1:9000;minio;minio123", "Minio credentials for uploading/downloading remote firecracker snapshots. Format: <minioAddr>;<minioAccessKey>;<minioSecretKey>")
 	endpoint := flag.String("endpoint", "localhost:8080", "Endpoint for the relay server")
@@ -425,11 +462,19 @@ func main() {
 	security := flag.String("security", snapshotting.SecurityModeNone,
 		"Snapshot security mode: none, full-dedup, partial, no-image-sharing, full")
 	baseSnap = flag.Bool("baseSnap", false, "Use base snapshot of booted VM for snapshot creation")
+	requireSnapshot = flag.Bool("requireSnapshot", false, "Fail instead of creating a VM when the requested snapshot is missing")
 	threads := flag.Int("j", 8, "How many concurrent uploads/downloads to run when transferring snapshots")
 	encryption := flag.Bool("encryption", false, "Enable snapshot encryption")
 	flag.Parse()
 	if *vmMemSizeMib == 0 || uint64(*vmMemSizeMib) > uint64(^uint32(0)) {
 		log.Fatalf("vmMemSizeMib must be between 1 and %d", uint64(^uint32(0)))
+	}
+	vmMemSizeBySnapshot, err := loadVMMemSizeMap(*vmMemSizeMapPath)
+	if err != nil {
+		log.Fatalf("invalid vmMemSizeMap: %v", err)
+	}
+	if len(vmMemSizeBySnapshot) > 0 && *baseSnap {
+		log.Fatal("-vmMemSizeMap cannot be combined with -baseSnap; the map is for pre-existing mixed-memory snapshots")
 	}
 	*security = snapshotting.NormalizeSecurityMode(*security)
 	if !snapshotting.IsValidSecurityMode(*security) {
@@ -518,6 +563,7 @@ func main() {
 		ctriface.WithClonePrefix(*clonePrefix),
 		ctriface.WithDNSNameservers(guestDNS),
 		ctriface.WithVMMemSizeMib(uint32(*vmMemSizeMib)),
+		ctriface.WithVMMemSizeBySnapshot(vmMemSizeBySnapshot),
 		ctriface.WithDockerCredentials(*dockerCredentials),
 		ctriface.WithMinioAddr(minioAddr),
 		ctriface.WithMinioAccessKey(minioAccessKey),
@@ -542,6 +588,8 @@ func main() {
 	snapMgr = orch.GetSnapshotManager()
 	log.Infof("SNAPSHARE_COMPRESSION_CONFIG ws=%t chunks=%t codec=zstd level=%d frame_size=%d fetchers=%d",
 		*isWSCompression, *isChunkCompression, *zstdLevel, *zstdFrameSize, *zstdFetchers)
+	log.Infof("SNAPSHARE_VM_MEMORY_CONFIG default_mib=%d mapped_revisions=%d require_snapshot=%t",
+		*vmMemSizeMib, len(vmMemSizeBySnapshot), *requireSnapshot)
 	time.Sleep(1 * time.Second) // Wait for orchestrator to fully initialize
 
 	if *baseSnap {
