@@ -1163,11 +1163,30 @@ func (mgr *SnapshotManager) PrepareBaseSnapshotChunksForRevision(revision string
 		log.Errorf("base snapshot revision %s is not loaded", revision)
 		return
 	}
-	baseSnap, err := os.Open(base.GetRecipeFilePath())
+	recipePath := base.GetRecipeFilePath()
+	baseSnap, err := os.Open(recipePath)
+	if err != nil && mgr.storage != nil {
+		// Lazy DownloadSnapshot intentionally does not materialize recipe_file.
+		// The converter has already committed it remotely in
+		// EnsureRemoteSnapshotChunked, so recover that exact recipe instead of
+		// re-chunking the base mem_file and then returning with an empty base set.
+		downloadErr := mgr.downloadFile(revision, recipePath, filepath.Base(recipePath))
+		if downloadErr == nil {
+			baseSnap, err = os.Open(recipePath)
+		} else {
+			log.Warnf("failed to download base snapshot recipe for %s: %v", revision, downloadErr)
+		}
+	}
 	if err != nil {
-		_ = mgr.uploadMemFile(base)
-		log.Errorf("failed to open base snapshot recipe file for %s: %v", revision, err)
-		return
+		if uploadErr := mgr.uploadMemFile(base); uploadErr != nil {
+			log.Errorf("failed to materialize base snapshot recipe for %s: %v", revision, uploadErr)
+			return
+		}
+		baseSnap, err = os.Open(recipePath)
+		if err != nil {
+			log.Errorf("failed to open materialized base snapshot recipe file for %s: %v", revision, err)
+			return
+		}
 	}
 	defer baseSnap.Close()
 	buffer := make([]byte, 16)
