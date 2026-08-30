@@ -43,6 +43,7 @@ var (
 	baseSnap        *bool
 	dropCaches      *bool
 	requireSnapshot *bool
+	revisionAliases map[string]string
 )
 
 const (
@@ -153,6 +154,53 @@ func loadVMMemSizeMap(path string) (map[string]uint32, error) {
 	return vmMemSizeBySnapshot, nil
 }
 
+func loadSnapshotRevisionMap(path string) (map[string]string, error) {
+	if path == "" {
+		return nil, nil
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("read snapshot revision map: %w", err)
+	}
+	aliases := make(map[string]string)
+	if err := json.Unmarshal(data, &aliases); err != nil {
+		return nil, fmt.Errorf("parse snapshot revision map: %w", err)
+	}
+	if len(aliases) == 0 {
+		return nil, fmt.Errorf("snapshot revision map is empty")
+	}
+	for rawRevision, snapshotRevision := range aliases {
+		if strings.TrimSpace(rawRevision) == "" || strings.TrimSpace(snapshotRevision) == "" {
+			return nil, fmt.Errorf("snapshot revision map contains an empty revision")
+		}
+	}
+	return aliases, nil
+}
+
+func snapshotRevision(rawRevision string, aliases map[string]string) (string, error) {
+	rawRevision = strings.TrimSpace(rawRevision)
+	if rawRevision == "" {
+		return "default", nil
+	}
+	if len(aliases) > 0 {
+		mapped, ok := aliases[rawRevision]
+		if !ok {
+			return "", fmt.Errorf("Knative revision %q is missing from snapshot revision map", rawRevision)
+		}
+		return mapped, nil
+	}
+
+	parts := strings.Split(rawRevision, "-")
+	if len(parts) < 3 {
+		return "", fmt.Errorf("Knative revision %q has fewer than three components", rawRevision)
+	}
+	revision := strings.Join(parts[:len(parts)-2], "-")
+	if revision == "" {
+		return "", fmt.Errorf("Knative revision %q canonicalized to an empty snapshot revision", rawRevision)
+	}
+	return revision, nil
+}
+
 func grpcStatus(header http.Header) string {
 	status := header.Get("Grpc-Status")
 	if status == "" {
@@ -203,11 +251,11 @@ func handler(w http.ResponseWriter, r *http.Request) {
 	if mapped, ok := imageMap[image]; ok {
 		image = mapped
 	}
-	rev := r.Header.Get("revision")
-	if rev == "" {
-		rev = "default"
-	} else {
-		rev = strings.Join(strings.Split(rev, "-")[:len(strings.Split(rev, "-"))-2], "-") // remove the unique suffix added by Knative
+	rev, revisionErr := snapshotRevision(r.Header.Get("revision"), revisionAliases)
+	if revisionErr != nil {
+		log.Errorf("invalid snapshot revision: %v", revisionErr)
+		http.Error(w, fmt.Sprintf("Invalid Snapshot Revision: %v", revisionErr), http.StatusBadRequest)
+		return
 	}
 	env := r.Header.Get("env")
 	envArr := []string{}
@@ -452,6 +500,7 @@ func main() {
 	dnsNameservers := flag.String("dnsNameservers", "", "Comma-separated DNS nameservers for microVMs; empty uses Kubernetes DNS discovery with the existing fallback")
 	vmMemSizeMib := flag.Uint("vmMemSizeMib", 512, "Memory size in MiB for newly created microVMs")
 	vmMemSizeMapPath := flag.String("vmMemSizeMap", "", "JSON map from snapshot revision to VM memory size in MiB; mapped restores fail closed on missing entries")
+	snapshotRevisionMapPath := flag.String("snapshotRevisionMap", "", "JSON map from exact Knative revision to stable snapshot revision; mapped requests fail closed on missing entries")
 	dockerCredentials := flag.String("dockerCredentials", `{"docker-credentials":{"ghcr.io":{"username":"","password":""}}}`, "Docker credentials for pulling images from inside a microVM") // https://github.com/firecracker-microvm/firecracker-containerd/blob/main/docker-credential-mmds
 	minioCredentials := flag.String("minioCredentials", "10.0.1.1:9000;minio;minio123", "Minio credentials for uploading/downloading remote firecracker snapshots. Format: <minioAddr>;<minioAccessKey>;<minioSecretKey>")
 	endpoint := flag.String("endpoint", "localhost:8080", "Endpoint for the relay server")
@@ -475,6 +524,10 @@ func main() {
 	}
 	if len(vmMemSizeBySnapshot) > 0 && *baseSnap {
 		log.Fatal("-vmMemSizeMap cannot be combined with -baseSnap; the map is for pre-existing mixed-memory snapshots")
+	}
+	revisionAliases, err = loadSnapshotRevisionMap(*snapshotRevisionMapPath)
+	if err != nil {
+		log.Fatalf("invalid snapshotRevisionMap: %v", err)
 	}
 	*security = snapshotting.NormalizeSecurityMode(*security)
 	if !snapshotting.IsValidSecurityMode(*security) {
@@ -590,6 +643,7 @@ func main() {
 		*isWSCompression, *isChunkCompression, *zstdLevel, *zstdFrameSize, *zstdFetchers)
 	log.Infof("SNAPSHARE_VM_MEMORY_CONFIG default_mib=%d mapped_revisions=%d require_snapshot=%t",
 		*vmMemSizeMib, len(vmMemSizeBySnapshot), *requireSnapshot)
+	log.Infof("SNAPSHARE_REVISION_CONFIG mapped_knative_revisions=%d", len(revisionAliases))
 	time.Sleep(1 * time.Second) // Wait for orchestrator to fully initialize
 
 	if *baseSnap {

@@ -46,6 +46,73 @@ func TestLoadVMMemSizeMap(t *testing.T) {
 	}
 }
 
+func TestSnapshotRevisionMap(t *testing.T) {
+	t.Run("empty path disables mapping", func(t *testing.T) {
+		got, err := loadSnapshotRevisionMap("")
+		if err != nil || got != nil {
+			t.Fatalf("loadSnapshotRevisionMap empty = %#v, %v; want nil, nil", got, err)
+		}
+	})
+
+	t.Run("valid map", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "revisions.json")
+		contents := `{"video-analytics-standalonhash-00001":"video-analytics-standalone-python-1"}`
+		if err := os.WriteFile(path, []byte(contents), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		got, err := loadSnapshotRevisionMap(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got["video-analytics-standalonhash-00001"] != "video-analytics-standalone-python-1" {
+			t.Fatalf("unexpected snapshot revision map: %#v", got)
+		}
+	})
+
+	for _, contents := range []string{`{}`, `{"": "revision"}`, `{"raw": ""}`, `[]`} {
+		contents := contents
+		t.Run("reject_"+contents, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "revisions.json")
+			if err := os.WriteFile(path, []byte(contents), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := loadSnapshotRevisionMap(path); err == nil {
+				t.Fatalf("loadSnapshotRevisionMap(%s) unexpectedly succeeded", contents)
+			}
+		})
+	}
+}
+
+func TestSnapshotRevision(t *testing.T) {
+	tests := []struct {
+		name    string
+		raw     string
+		aliases map[string]string
+		want    string
+		wantErr bool
+	}{
+		{name: "empty defaults", want: "default"},
+		{name: "legacy canonicalization", raw: "aes-go-45000-123-00001", want: "aes-go-45000"},
+		{name: "mapped truncated revision", raw: "video-analytics-standalonhash-00001", aliases: map[string]string{"video-analytics-standalonhash-00001": "video-analytics-standalone-python-1"}, want: "video-analytics-standalone-python-1"},
+		{name: "mapped missing fails closed", raw: "unknown-00001", aliases: map[string]string{"known-00001": "known"}, wantErr: true},
+		{name: "short legacy revision", raw: "short", wantErr: true},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			got, err := snapshotRevision(test.raw, test.aliases)
+			if test.wantErr {
+				if err == nil {
+					t.Fatalf("snapshotRevision(%q) unexpectedly succeeded with %q", test.raw, got)
+				}
+				return
+			}
+			if err != nil || got != test.want {
+				t.Fatalf("snapshotRevision(%q) = %q, %v; want %q", test.raw, got, err, test.want)
+			}
+		})
+	}
+}
+
 func TestFunctionEndpointPort(t *testing.T) {
 	tests := []struct {
 		name      string
