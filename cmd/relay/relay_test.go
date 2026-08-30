@@ -47,6 +47,27 @@ func TestFunctionEndpointPort(t *testing.T) {
 	}
 }
 
+func TestNeedsDirectSourceReadiness(t *testing.T) {
+	tests := []struct {
+		name              string
+		startedFromSource bool
+		relayArgs         string
+		want              bool
+	}{
+		{name: "fresh direct source", startedFromSource: true, want: true},
+		{name: "direct snapshot restore", startedFromSource: false, want: false},
+		{name: "fresh auxiliary relay", startedFromSource: true, relayArgs: "--function-name=aes-go", want: false},
+		{name: "snapshot auxiliary relay", startedFromSource: false, relayArgs: "--function-name=aes-go", want: false},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := needsDirectSourceReadiness(test.startedFromSource, test.relayArgs); got != test.want {
+				t.Fatalf("needsDirectSourceReadiness(%v, %q) = %v, want %v", test.startedFromSource, test.relayArgs, got, test.want)
+			}
+		})
+	}
+}
+
 func TestWaitForTCPReady(t *testing.T) {
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {

@@ -126,6 +126,10 @@ func functionEndpointPort(directPort, relayArgs string) (string, error) {
 	return defaultPort, nil
 }
 
+func needsDirectSourceReadiness(startedFromSource bool, relayArgs string) bool {
+	return startedFromSource && relayArgs == ""
+}
+
 func grpcStatus(header http.Header) string {
 	status := header.Get("Grpc-Status")
 	if status == "" {
@@ -204,6 +208,7 @@ func handler(w http.ResponseWriter, r *http.Request) {
 	var err error
 	var snap *snapshotting.Snapshot
 	var metric *metrics.Metric
+	startedFromSource := false
 
 	var ok bool
 	if snap, err = snapMgr.AcquireSnapshot(rev); err == nil { // local case
@@ -248,9 +253,11 @@ func handler(w http.ResponseWriter, r *http.Request) {
 		metric.PrintAll()
 	} else if *baseSnap { // start from base snapshot case
 		log.Debugf("No snapshot for rev %s, starting from base snapshot", rev)
+		startedFromSource = true
 		resp, err = orch.StartWithBaseSnapshot(ctx, image, envArr, argsArr)
 	} else { // boot case
 		log.Debugf("No snapshot for rev %s, starting from image", rev)
+		startedFromSource = true
 		resp, _, err = orch.StartVMWithEnvironment(ctx, image, envArr, argsArr)
 	}
 	if err != nil {
@@ -265,6 +272,22 @@ func handler(w http.ResponseWriter, r *http.Request) {
 	log.Debugf("created VM with ID %s and IP %s for revision %s", resp.VMID, resp.GuestIP, r.Header.Get("revision"))
 	functionEndpoint := net.JoinHostPort(resp.GuestIP, functionPort)
 	endpoint := functionEndpoint
+	if needsDirectSourceReadiness(startedFromSource, relayArgs) {
+		// A fresh image/base start returns as soon as the container task exists,
+		// before the function necessarily listens.  Source creation is outside
+		// the measured restore path, so wait here to make its first native RPC
+		// reliable.  Snapshot restores deliberately skip this guard: adding a
+		// readiness poll there changes the paper's direct-request latency path.
+		if err := waitForTCP(ctx, functionEndpoint, functionReadyTimeout); err != nil {
+			log.Errorf("fresh-source function readiness check failed for VM %s: %v", vmId, err)
+			if stopErr := orch.StopSingleVM(ctx, vmId); stopErr != nil {
+				log.Errorf("failed to stop unready fresh-source VM %s: %v", vmId, stopErr)
+			}
+			http.Error(w, fmt.Sprintf("Fresh Source Function Readiness Error: %v", err), http.StatusServiceUnavailable)
+			return
+		}
+		log.Debugf("fresh-source function endpoint %s is ready", functionEndpoint)
+	}
 	if relayArgs != "" {
 		// The auxiliary vSwarm relay cannot establish its downstream gRPC
 		// connection until the restored function is listening.  Keep this
