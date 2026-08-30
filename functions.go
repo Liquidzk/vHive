@@ -96,7 +96,11 @@ func NewFuncPool(saveMemoryMode bool, servedTh uint64, pinnedFuncNum int, testMo
 		}
 	}
 
-	p.snapshotManager = snapshotting.NewSnapshotManager(snapshotDir, objectStore, false)
+	p.snapshotManager = snapshotting.NewSnapshotManager(
+		snapshotDir, objectStore,
+		false, false, false, false, false, false,
+		0, 0, "none", 1, false, false,
+	)
 
 	if !testModeOn {
 		heartbeat := time.NewTicker(60 * time.Second)
@@ -391,12 +395,12 @@ func (f *Function) AddInstance() *metrics.Metric {
 		f.vmID = f.getVMID()
 		f.lastInstanceID++
 	} else {
-		resp, _, err := orch.StartVM(ctx, f.getVMID(), f.imageName)
+		resp, _, err := orch.StartVM(ctx, f.imageName)
 		if err != nil {
 			log.Panic(err)
 		}
 		f.guestIP = resp.GuestIP
-		f.vmID = f.getVMID()
+		f.vmID = resp.VMID
 		f.lastInstanceID++
 	}
 
@@ -516,10 +520,11 @@ func (f *Function) LoadInstance(vmID string) (*ctriface.StartVMResponse, *metric
 		log.Panic(err)
 	}
 
-	resp, loadMetr, err := orch.LoadSnapshot(ctx, vmID, snap)
+	resp, loadMetr, err := orch.LoadSnapshot(ctx, snap, false, false)
 	if err != nil {
 		log.Panic(err)
 	}
+	vmID = resp.VMID
 
 	resumeMetr, err := orch.ResumeVM(ctx, vmID)
 	if err != nil {

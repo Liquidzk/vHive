@@ -92,7 +92,13 @@ func newFirecrackerCoordinator(orch *ctriface.Orchestrator, opts ...coordinatorO
 		}
 	}
 
-	c.snapshotManager = snapshotting.NewSnapshotManager(snapshotsDir, objectStore, false)
+	// The legacy CRI adapter uses unchunked snapshots. Keep that behavior while
+	// supplying the options added to SnapshotManager by the SnapShare path.
+	c.snapshotManager = snapshotting.NewSnapshotManager(
+		snapshotsDir, objectStore,
+		false, false, false, false, false, false,
+		0, 0, "none", 1, false, false,
+	)
 
 	return c
 }
@@ -193,9 +199,12 @@ func (c *coordinator) orchStartVM(ctx context.Context, image, revision string, e
 	defer cancel()
 
 	if !c.withoutOrchestrator {
-		resp, _, err = c.orch.StartVMWithEnvironment(ctxTimeout, vmID, image, envVariables)
+		resp, _, err = c.orch.StartVMWithEnvironment(ctxTimeout, image, envVariables, []string{})
 		if err != nil {
 			logger.WithError(err).Error("coordinator failed to start VM")
+		}
+		if resp != nil {
+			vmID = resp.VMID
 		}
 	}
 
@@ -218,11 +227,12 @@ func (c *coordinator) orchLoadInstance(ctx context.Context, snap *snapshotting.S
 	ctxTimeout, cancel := context.WithTimeout(ctx, time.Second*30)
 	defer cancel()
 
-	resp, _, err := c.orch.LoadSnapshot(ctxTimeout, vmID, snap)
+	resp, _, err := c.orch.LoadSnapshot(ctxTimeout, snap, false, false)
 	if err != nil {
 		logger.WithError(err).Error("failed to load VM")
 		return nil, err
 	}
+	vmID = resp.VMID
 
 	if _, err := c.orch.ResumeVM(ctxTimeout, vmID); err != nil {
 		logger.WithError(err).Error("failed to load VM")
