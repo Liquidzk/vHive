@@ -466,9 +466,11 @@ func (po *PageOperations) ZeroOut(uffd int, addr uint64) bool {
 
 // PageFaultTracer handles tracing page fault events to a file
 type PageFaultTracer struct {
+	mu      sync.Mutex
 	file    *os.File
 	writer  *csv.Writer
 	counter uint64
+	seenPFN map[uint64]struct{}
 	logger  *log.Entry
 	delay   time.Duration
 	enabled atomic.Bool
@@ -503,6 +505,7 @@ func NewPageFaultTracer(filePath string, logger *log.Entry) (*PageFaultTracer, e
 		file:    file,
 		writer:  writer,
 		counter: 0,
+		seenPFN: make(map[uint64]struct{}),
 		logger:  logger,
 		delay:   0 * time.Second,
 	}
@@ -523,6 +526,15 @@ func (t *PageFaultTracer) TracePageFault(address, pfn uint64, eventType string, 
 	if t == nil || !t.enabled.Load() {
 		return
 	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if !t.enabled.Load() {
+		return
+	}
+	if _, seen := t.seenPFN[pfn]; seen {
+		return
+	}
+	t.seenPFN[pfn] = struct{}{}
 	t.counter++
 	if t.writer == nil {
 		return
@@ -538,6 +550,11 @@ func (t *PageFaultTracer) TracePageFault(address, pfn uint64, eventType string, 
 
 func (t *PageFaultTracer) AddDelay(d time.Duration) {
 	if t == nil || !t.enabled.Load() {
+		return
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if !t.enabled.Load() {
 		return
 	}
 	t.delay += d
@@ -560,6 +577,8 @@ func (t *PageFaultTracer) Close() error {
 	if t == nil {
 		return nil
 	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
 	t.logger.Debugf("Handled %d page faults in %v", t.counter, t.delay)
 	if t.writer != nil {
 		t.writer.Flush()
