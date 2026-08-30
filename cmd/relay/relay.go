@@ -90,8 +90,22 @@ func allocateLoopbackEndpoint() (string, error) {
 	return endpoint, nil
 }
 
-func functionEndpointPort(relayArgs string) (string, error) {
+func parseFunctionPort(value, source string) (string, error) {
+	port, err := strconv.ParseUint(value, 10, 16)
+	if err != nil || port == 0 {
+		return "", fmt.Errorf("invalid %s %q", source, value)
+	}
+	return strconv.FormatUint(port, 10), nil
+}
+
+func functionEndpointPort(directPort, relayArgs string) (string, error) {
 	const defaultPort = "50051"
+	if directPort != "" {
+		if relayArgs != "" {
+			return "", fmt.Errorf("functionPort and relayArgs are mutually exclusive")
+		}
+		return parseFunctionPort(directPort, "functionPort")
+	}
 	fields := strings.Fields(relayArgs)
 	for i, field := range fields {
 		var value string
@@ -107,11 +121,7 @@ func functionEndpointPort(relayArgs string) (string, error) {
 			continue
 		}
 
-		port, err := strconv.ParseUint(value, 10, 16)
-		if err != nil || port == 0 {
-			return "", fmt.Errorf("invalid --function-endpoint-port %q", value)
-		}
-		return strconv.FormatUint(port, 10), nil
+		return parseFunctionPort(value, "--function-endpoint-port")
 	}
 	return defaultPort, nil
 }
@@ -183,7 +193,7 @@ func handler(w http.ResponseWriter, r *http.Request) {
 		argsArr = strings.Split(args, " ")
 	}
 	relayArgs := r.Header.Get("relayArgs")
-	functionPort, parseErr := functionEndpointPort(relayArgs)
+	functionPort, parseErr := functionEndpointPort(r.Header.Get("functionPort"), relayArgs)
 	if parseErr != nil {
 		http.Error(w, fmt.Sprintf("Invalid Relay Args: %v", parseErr), http.StatusBadRequest)
 		return

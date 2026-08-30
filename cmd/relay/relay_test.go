@@ -11,32 +11,37 @@ import (
 func TestFunctionEndpointPort(t *testing.T) {
 	tests := []struct {
 		name      string
+		direct    string
 		args      string
 		want      string
 		wantError bool
 	}{
 		{name: "default", args: "--function-name=aes-go", want: "50051"},
+		{name: "direct", direct: "3550", want: "3550"},
 		{name: "equals", args: "--function-endpoint-port=7000 --function-name=currencyservice", want: "7000"},
 		{name: "separate", args: "--function-endpoint-port 8080 --function-name=emailservice", want: "8080"},
 		{name: "missing", args: "--function-endpoint-port", wantError: true},
 		{name: "zero", args: "--function-endpoint-port=0", wantError: true},
 		{name: "not-number", args: "--function-endpoint-port=http", wantError: true},
+		{name: "direct-zero", direct: "0", wantError: true},
+		{name: "direct-not-number", direct: "http", wantError: true},
+		{name: "ambiguous", direct: "50051", args: "--function-name=aes-go", wantError: true},
 	}
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			got, err := functionEndpointPort(test.args)
+			got, err := functionEndpointPort(test.direct, test.args)
 			if test.wantError {
 				if err == nil {
-					t.Fatalf("functionEndpointPort(%q) unexpectedly succeeded with %q", test.args, got)
+					t.Fatalf("functionEndpointPort(%q, %q) unexpectedly succeeded with %q", test.direct, test.args, got)
 				}
 				return
 			}
 			if err != nil {
-				t.Fatalf("functionEndpointPort(%q): %v", test.args, err)
+				t.Fatalf("functionEndpointPort(%q, %q): %v", test.direct, test.args, err)
 			}
 			if got != test.want {
-				t.Fatalf("functionEndpointPort(%q) = %q, want %q", test.args, got, test.want)
+				t.Fatalf("functionEndpointPort(%q, %q) = %q, want %q", test.direct, test.args, got, test.want)
 			}
 		})
 	}
