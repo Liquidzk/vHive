@@ -961,6 +961,8 @@ func (o *Orchestrator) LoadSnapshot(ctx context.Context, snap *snapshotting.Snap
 	if err != nil {
 		return nil, nil, err
 	}
+	log.Infof("SNAPSHARE_VM_MEMORY_SELECTED revision=%s vm_mib=%d mapped=%t",
+		snap.GetId(), vmMemSizeMib, len(o.vmMemSizeBySnapshot) > 0)
 
 	// Acquire a VM ID from the shim pool
 	vmID, err := o.AcquireShimFromPool(ctx)
