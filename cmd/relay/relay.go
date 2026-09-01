@@ -48,7 +48,41 @@ const (
 	functionReadyTimeout = 60 * time.Second
 	relayReadyTimeout    = 10 * time.Second
 	readyRetryInterval   = 100 * time.Millisecond
+	remoteFetchStatsPath = "/__snapshare/remote-fetch-stats"
 )
+
+func handleRemoteFetchStats(w http.ResponseWriter, r *http.Request) bool {
+	if r.URL.Path != remoteFetchStatsPath {
+		return false
+	}
+	if snapMgr == nil {
+		http.Error(w, "snapshot manager is not ready", http.StatusServiceUnavailable)
+		return true
+	}
+
+	switch r.Method {
+	case http.MethodGet:
+		stats, ok := snapMgr.SnapshotRemoteFetchStats()
+		if !ok {
+			http.Error(w, "remote fetch accounting is unavailable", http.StatusNotImplemented)
+			return true
+		}
+		w.Header().Set("Content-Type", "application/json")
+		if err := json.NewEncoder(w).Encode(stats); err != nil {
+			log.Errorf("encode remote fetch stats: %v", err)
+		}
+	case http.MethodPost:
+		if !snapMgr.ResetRemoteFetchStats() {
+			http.Error(w, "remote fetch accounting is unavailable", http.StatusNotImplemented)
+			return true
+		}
+		w.WriteHeader(http.StatusNoContent)
+	default:
+		w.Header().Set("Allow", http.MethodGet+", "+http.MethodPost)
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+	}
+	return true
+}
 
 func waitForTCP(ctx context.Context, address string, timeout time.Duration) error {
 	readyCtx, cancel := context.WithTimeout(ctx, timeout)
@@ -170,6 +204,9 @@ func (r *statusRecorder) Flush() {
 }
 
 func handler(w http.ResponseWriter, r *http.Request) {
+	if handleRemoteFetchStats(w, r) {
+		return
+	}
 	log.Debugf("request received, image %s, revision %s", r.Header.Get("image"), r.Header.Get("revision"))
 	startTime := time.Now()
 

@@ -27,6 +27,30 @@ import (
 	"io"
 )
 
+// RemoteFetchClassStats reports successful logical GET operations and the
+// response bytes delivered to the caller. It deliberately excludes HEAD,
+// LIST, uploads, and bytes retried internally by the HTTP transport.
+type RemoteFetchClassStats struct {
+	Requests uint64 `json:"requests"`
+	Bytes    uint64 `json:"bytes"`
+}
+
+// RemoteFetchStats is a process-local snapshot of object-store reads. Classes
+// are stable strings so evaluation runners can validate individual data paths
+// without parsing a high-volume external MinIO trace.
+type RemoteFetchStats struct {
+	Total   RemoteFetchClassStats            `json:"total"`
+	Classes map[string]RemoteFetchClassStats `json:"classes"`
+}
+
+// RemoteFetchStatsStorage is implemented by object stores that expose exact
+// process-local response-byte accounting. Reset must only be used at a quiescent
+// experiment boundary.
+type RemoteFetchStatsStorage interface {
+	SnapshotRemoteFetchStats() RemoteFetchStats
+	ResetRemoteFetchStats()
+}
+
 // ObjectStorage defines the interface for object storage operations
 type ObjectStorage interface {
 	// UploadObject uploads an object

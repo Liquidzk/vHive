@@ -26,7 +26,10 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"os"
+	"strings"
 	"sync"
+	"sync/atomic"
 
 	"github.com/minio/minio-go/v7"
 	"github.com/pkg/errors"
@@ -35,6 +38,107 @@ import (
 type MinioStorage struct {
 	client     *minio.Client
 	bucketName string
+	fetchStats [remoteFetchClassCount]remoteFetchCounter
+}
+
+const (
+	remoteFetchChunks = iota
+	remoteFetchWorkingSetPayload
+	remoteFetchRecipe
+	remoteFetchWorkingSetMetadata
+	remoteFetchSnapshotMetadata
+	remoteFetchSharedWorkingSet
+	remoteFetchOther
+	remoteFetchClassCount
+)
+
+var remoteFetchClassNames = [remoteFetchClassCount]string{
+	"chunks",
+	"working_set_payload",
+	"recipe",
+	"working_set_metadata",
+	"snapshot_metadata",
+	"shared_working_set",
+	"other",
+}
+
+type remoteFetchCounter struct {
+	requests atomic.Uint64
+	bytes    atomic.Uint64
+}
+
+type countingReadCloser struct {
+	inner   io.ReadCloser
+	counter *remoteFetchCounter
+	once    sync.Once
+}
+
+func (reader *countingReadCloser) Read(buffer []byte) (int, error) {
+	n, err := reader.inner.Read(buffer)
+	if n > 0 {
+		reader.once.Do(func() { reader.counter.requests.Add(1) })
+		reader.counter.bytes.Add(uint64(n))
+	}
+	return n, err
+}
+
+func (reader *countingReadCloser) Close() error {
+	return reader.inner.Close()
+}
+
+func remoteFetchClass(objectKey string) int {
+	base := objectKey
+	if slash := strings.LastIndexByte(objectKey, '/'); slash >= 0 {
+		base = objectKey[slash+1:]
+	}
+	switch {
+	case strings.HasPrefix(objectKey, "_chunks_zstd_v1/") ||
+		strings.HasPrefix(objectKey, "_chunks_zstd_v1_l") ||
+		strings.Contains(objectKey, "/_chunks_zstd_v1/") ||
+		strings.Contains(objectKey, "/_chunks_zstd_v1_l"):
+		return remoteFetchChunks
+	case strings.Contains(base, "working_set_pages_content") && strings.HasSuffix(base, ".zstd.frames"):
+		return remoteFetchWorkingSetPayload
+	case base == "recipe_file":
+		return remoteFetchRecipe
+	case base == "working_set_pages" ||
+		strings.HasPrefix(base, "working_set_pages_index") ||
+		(strings.Contains(base, "working_set_pages_content") && strings.HasSuffix(base, ".zstd.json")):
+		return remoteFetchWorkingSetMetadata
+	case base == "snap_file" || base == "info_file":
+		return remoteFetchSnapshotMetadata
+	case strings.HasPrefix(objectKey, "ws_shared/") || strings.Contains(objectKey, "/ws_shared/"):
+		return remoteFetchSharedWorkingSet
+	default:
+		return remoteFetchOther
+	}
+}
+
+func (m *MinioStorage) countCompletedObjectRead(objectKey string, bytes uint64) {
+	counter := &m.fetchStats[remoteFetchClass(objectKey)]
+	counter.requests.Add(1)
+	counter.bytes.Add(bytes)
+}
+
+func (m *MinioStorage) SnapshotRemoteFetchStats() RemoteFetchStats {
+	stats := RemoteFetchStats{Classes: make(map[string]RemoteFetchClassStats, remoteFetchClassCount)}
+	for index, name := range remoteFetchClassNames {
+		entry := RemoteFetchClassStats{
+			Requests: m.fetchStats[index].requests.Load(),
+			Bytes:    m.fetchStats[index].bytes.Load(),
+		}
+		stats.Classes[name] = entry
+		stats.Total.Requests += entry.Requests
+		stats.Total.Bytes += entry.Bytes
+	}
+	return stats
+}
+
+func (m *MinioStorage) ResetRemoteFetchStats() {
+	for index := range m.fetchStats {
+		m.fetchStats[index].requests.Store(0)
+		m.fetchStats[index].bytes.Store(0)
+	}
 }
 
 func NewMinioStorage(client *minio.Client, bucketName string) (*MinioStorage, error) {
@@ -147,7 +251,10 @@ func (m *MinioStorage) OpenObjectRange(ctx context.Context, objectKey string, of
 	if err != nil {
 		return nil, errors.Wrapf(err, "open object %s range [%d,%d]", objectKey, offset, end)
 	}
-	return obj, nil
+	return &countingReadCloser{
+		inner:   obj,
+		counter: &m.fetchStats[remoteFetchClass(objectKey)],
+	}, nil
 }
 
 func (m *MinioStorage) Exists(objectKey string) (bool, error) {
@@ -205,5 +312,13 @@ func (m *MinioStorage) DownloadFile(objectKey string, filePath string) error {
 		filePath,
 		minio.GetObjectOptions{},
 	)
-	return errors.Wrapf(err, "downloading object %s to %s", objectKey, filePath)
+	if err != nil {
+		return errors.Wrapf(err, "downloading object %s to %s", objectKey, filePath)
+	}
+	stat, err := os.Stat(filePath)
+	if err != nil {
+		return errors.Wrapf(err, "stat downloaded object %s at %s", objectKey, filePath)
+	}
+	m.countCompletedObjectRead(objectKey, uint64(stat.Size()))
+	return nil
 }

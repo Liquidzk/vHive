@@ -155,6 +155,27 @@ func (mgr *SnapshotManager) GetCleanChunks() bool {
 	return mgr.cleanChunks
 }
 
+// SnapshotRemoteFetchStats returns exact response-byte counters when the
+// configured remote object store supports them.
+func (mgr *SnapshotManager) SnapshotRemoteFetchStats() (storage.RemoteFetchStats, bool) {
+	tracked, ok := mgr.storage.(storage.RemoteFetchStatsStorage)
+	if !ok {
+		return storage.RemoteFetchStats{}, false
+	}
+	return tracked.SnapshotRemoteFetchStats(), true
+}
+
+// ResetRemoteFetchStats resets process-local counters at an experiment
+// boundary. Callers must ensure no restore is active.
+func (mgr *SnapshotManager) ResetRemoteFetchStats() bool {
+	tracked, ok := mgr.storage.(storage.RemoteFetchStatsStorage)
+	if !ok {
+		return false
+	}
+	tracked.ResetRemoteFetchStats()
+	return true
+}
+
 func (mgr *SnapshotManager) GetChunkSize() uint64 {
 	return mgr.chunkSize
 }
