@@ -3317,14 +3317,7 @@ func (mgr *SnapshotManager) getFileContent(revision, localPath string) ([]byte, 
 
 	if !mgr.cleanChunks {
 		go func(path string, content []byte) {
-			dir := filepath.Dir(path)
-			if _, err := os.Stat(dir); os.IsNotExist(err) {
-				if err := os.MkdirAll(dir, os.ModePerm); err != nil {
-					log.Warnf("Failed to create directory %s for background persist: %v", dir, err)
-					return
-				}
-			}
-			if err := os.WriteFile(path, content, 0644); err != nil {
+			if err := persistFileAtomic(path, content); err != nil {
 				log.Warnf("Failed to write file %s in background: %v", path, err)
 				return
 			}
@@ -3385,14 +3378,7 @@ func (mgr *SnapshotManager) getFileContentManaged(revision, localPath string) ([
 
 	if !mgr.cleanChunks {
 		go func(path string, content []byte) {
-			dir := filepath.Dir(path)
-			if _, err := os.Stat(dir); os.IsNotExist(err) {
-				if err := os.MkdirAll(dir, os.ModePerm); err != nil {
-					log.Warnf("Failed to create directory %s for background persist: %v", dir, err)
-					return
-				}
-			}
-			if err := os.WriteFile(path, content, 0644); err != nil {
+			if err := persistFileAtomic(path, content); err != nil {
 				log.Warnf("Failed to write file %s in background: %v", path, err)
 				return
 			}
@@ -3401,6 +3387,38 @@ func (mgr *SnapshotManager) getFileContentManaged(revision, localPath string) ([
 	}
 
 	return data, func() {}, nil
+}
+
+// persistFileAtomic prevents readers from mmaping a partially persisted cache
+// object. Multiple first restores may download the same remote object and
+// persist it concurrently; every writer therefore publishes a complete file
+// with rename instead of truncating the shared destination in place.
+func persistFileAtomic(path string, content []byte) (err error) {
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, os.ModePerm); err != nil {
+		return err
+	}
+
+	tmp, err := os.CreateTemp(dir, "."+filepath.Base(path)+".tmp-*")
+	if err != nil {
+		return err
+	}
+	tmpPath := tmp.Name()
+	defer func() {
+		_ = tmp.Close()
+		_ = os.Remove(tmpPath)
+	}()
+
+	if err := tmp.Chmod(0644); err != nil {
+		return err
+	}
+	if _, err := tmp.Write(content); err != nil {
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	return os.Rename(tmpPath, path)
 }
 
 func (mgr *SnapshotManager) isWorkingSetCacheFile(localPath string) bool {
