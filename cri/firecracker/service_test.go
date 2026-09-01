@@ -6,7 +6,7 @@ package firecracker
 
 import "testing"
 
-func TestIsStockMultiContainerUserName(t *testing.T) {
+func TestIsStockMultiContainerSiblingName(t *testing.T) {
 	tests := []struct {
 		name      string
 		container string
@@ -14,15 +14,17 @@ func TestIsStockMultiContainerUserName(t *testing.T) {
 	}{
 		{name: "first user container", container: "user-container-0", want: true},
 		{name: "second user container", container: "user-container-1", want: true},
+		{name: "explicit relay container", container: "relay", want: true},
+		{name: "explicit function container", container: "function", want: true},
 		{name: "vm placeholder", container: "user-container", want: false},
 		{name: "queue proxy", container: "queue-proxy", want: false},
-		{name: "unrelated prefix", container: "user-containerized", want: false},
+		{name: "empty metadata", container: "", want: false},
 	}
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := isStockMultiContainerUserName(tc.container); got != tc.want {
-				t.Fatalf("isStockMultiContainerUserName(%q) = %v, want %v", tc.container, got, tc.want)
+			if got := isStockMultiContainerSiblingName(tc.container); got != tc.want {
+				t.Fatalf("isStockMultiContainerSiblingName(%q) = %v, want %v", tc.container, got, tc.want)
 			}
 		})
 	}

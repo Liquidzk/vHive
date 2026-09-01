@@ -25,7 +25,6 @@ package firecracker
 import (
 	"context"
 	"errors"
-	"strings"
 	"sync"
 
 	log "github.com/sirupsen/logrus"
@@ -157,7 +156,7 @@ func (fs *FirecrackerService) createQueueProxy(ctx context.Context, r *criapi.Cr
 	podID := r.GetPodSandboxId()
 	vmConfig, isVM := fs.lookupVMConfig(podID)
 	if !isVM {
-		isStockMultiContainer, err := fs.hasStockMultiContainerUser(ctx, podID)
+		isStockMultiContainer, err := fs.hasStockMultiContainerSibling(ctx, podID)
 		if err != nil {
 			log.WithError(err).Error("failed to inspect stock containers before creating queue-proxy")
 			return nil, err
@@ -187,7 +186,7 @@ func (fs *FirecrackerService) createQueueProxy(ctx context.Context, r *criapi.Cr
 	return resp, nil
 }
 
-func (fs *FirecrackerService) hasStockMultiContainerUser(ctx context.Context, podID string) (bool, error) {
+func (fs *FirecrackerService) hasStockMultiContainerSibling(ctx context.Context, podID string) (bool, error) {
 	resp, err := fs.stockRuntimeClient.ListContainers(ctx, &criapi.ListContainersRequest{
 		Filter: &criapi.ContainerFilter{PodSandboxId: podID},
 	})
@@ -196,7 +195,7 @@ func (fs *FirecrackerService) hasStockMultiContainerUser(ctx context.Context, po
 	}
 
 	for _, container := range resp.GetContainers() {
-		if isStockMultiContainerUserName(container.GetMetadata().GetName()) {
+		if isStockMultiContainerSiblingName(container.GetMetadata().GetName()) {
 			return true, nil
 		}
 	}
@@ -204,8 +203,13 @@ func (fs *FirecrackerService) hasStockMultiContainerUser(ctx context.Context, po
 	return false, nil
 }
 
-func isStockMultiContainerUserName(name string) bool {
-	return strings.HasPrefix(name, userContainerName+"-")
+func isStockMultiContainerSiblingName(name string) bool {
+	// Knative keeps explicit container names from the Revision (for example,
+	// "relay" and "function"), while unnamed multi-container Revisions are
+	// normalized to user-container-0, user-container-1, and so on.  Either is
+	// evidence that this is an ordinary multi-container Pod.  The exact
+	// "user-container" name remains reserved for the Firecracker path.
+	return name != "" && name != userContainerName && name != queueProxyName
 }
 
 func (fs *FirecrackerService) RemoveContainer(ctx context.Context, r *criapi.RemoveContainerRequest) (*criapi.RemoveContainerResponse, error) {
