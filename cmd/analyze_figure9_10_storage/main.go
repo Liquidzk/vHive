@@ -22,9 +22,14 @@ import (
 
 	"github.com/minio/minio-go/v7"
 	"github.com/minio/minio-go/v7/pkg/credentials"
+	"github.com/vhive-serverless/vhive/snapshotting/zstdstream"
 )
 
-const pageSize = 4096
+const (
+	pageSize            = 4096
+	sharedZstdLevel     = 3
+	sharedZstdFrameSize = int64(1024 * 1024)
+)
 
 type workload struct {
 	Profile        string `json:"profile"`
@@ -72,17 +77,25 @@ type systemResult struct {
 	WorkingSetRepresentation string  `json:"working_set_representation"`
 }
 
+type sharedSourceMetrics struct {
+	Objects         int   `json:"objects"`
+	RawBytes        int64 `json:"raw_bytes"`
+	CompressedBytes int64 `json:"compressed_bytes"`
+	Frames          int   `json:"frames"`
+}
+
 type report struct {
-	Method               string                   `json:"method"`
-	GeneratedAt          string                   `json:"generated_at"`
-	SemanticRevisions    int                      `json:"semantic_revisions"`
-	PageSize             int                      `json:"page_size"`
-	RawFullSnapshotBytes int64                    `json:"raw_full_snapshot_bytes"`
-	Compression          string                   `json:"compression"`
-	PersistentMetadata   string                   `json:"persistent_metadata"`
-	FullDedupBoundary    string                   `json:"full_dedup_boundary"`
-	Corpora              map[string]corpusMetrics `json:"corpora"`
-	Systems              []systemResult           `json:"systems"`
+	Method               string                         `json:"method"`
+	GeneratedAt          string                         `json:"generated_at"`
+	SemanticRevisions    int                            `json:"semantic_revisions"`
+	PageSize             int                            `json:"page_size"`
+	RawFullSnapshotBytes int64                          `json:"raw_full_snapshot_bytes"`
+	Compression          string                         `json:"compression"`
+	PersistentMetadata   string                         `json:"persistent_metadata"`
+	FullDedupBoundary    string                         `json:"full_dedup_boundary"`
+	SharedSources        map[string]sharedSourceMetrics `json:"shared_sources"`
+	Corpora              map[string]corpusMetrics       `json:"corpora"`
+	Systems              []systemResult                 `json:"systems"`
 }
 
 func parseRecipe(data []byte) ([]string, error) {
@@ -280,14 +293,29 @@ func sumPayloads(ctx context.Context, c corpus, bucket string, workloads []workl
 	return total, nil
 }
 
-func sumSharedSources(ctx context.Context, c corpus, bucket string, workloads []workload, shareImages bool) (int64, error) {
-	base, err := objectSize(ctx, c, bucket, "ws_shared/base_rootfs/content")
+func addCompressedSharedSource(ctx context.Context, c corpus, bucket, key string, metrics *sharedSourceMetrics) error {
+	raw, err := download(ctx, c, bucket, key)
 	if err != nil {
-		return 0, err
+		return err
 	}
-	total := base
+	payload, manifest, err := zstdstream.Encode(raw, sharedZstdFrameSize, sharedZstdLevel)
+	if err != nil {
+		return fmt.Errorf("compress shared source %s/%s: %w", c.name, key, err)
+	}
+	metrics.Objects++
+	metrics.RawBytes += int64(len(raw))
+	metrics.CompressedBytes += int64(len(payload))
+	metrics.Frames += len(manifest.Frames)
+	return nil
+}
+
+func compressedSharedSources(ctx context.Context, c corpus, bucket string, workloads []workload, shareImages bool) (sharedSourceMetrics, error) {
+	var metrics sharedSourceMetrics
+	if err := addCompressedSharedSource(ctx, c, bucket, "ws_shared/base_rootfs/content", &metrics); err != nil {
+		return sharedSourceMetrics{}, err
+	}
 	if !shareImages {
-		return total, nil
+		return metrics, nil
 	}
 	images := make(map[string]struct{})
 	for _, workload := range workloads {
@@ -301,13 +329,11 @@ func sumSharedSources(ctx context.Context, c corpus, bucket string, workloads []
 	}
 	sort.Strings(ordered)
 	for _, image := range ordered {
-		size, err := objectSize(ctx, c, bucket, path.Join("ws_shared/images", image, "content"))
-		if err != nil {
-			return 0, err
+		if err := addCompressedSharedSource(ctx, c, bucket, path.Join("ws_shared/images", image, "content"), &metrics); err != nil {
+			return sharedSourceMetrics{}, err
 		}
-		total += size
 	}
-	return total, nil
+	return metrics, nil
 }
 
 func main() {
@@ -404,7 +430,7 @@ func main() {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
-	noImageShared, err := sumSharedSources(ctx, corpora["no-image-4k"], *bucket, config.Workloads, false)
+	noImageShared, err := compressedSharedSources(ctx, corpora["no-image-4k"], *bucket, config.Workloads, false)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
@@ -414,7 +440,7 @@ func main() {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
-	splitShared, err := sumSharedSources(ctx, corpora["partial-4k"], *bucket, config.Workloads, true)
+	splitShared, err := compressedSharedSources(ctx, corpora["partial-4k"], *bucket, config.Workloads, true)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
@@ -429,8 +455,8 @@ func main() {
 		{"Chunks", "full-128k", "reachable independently compressed 128-KiB chunks", 0, metrics["full-128k"].WorkingSetChunkBytes},
 		{"Pages", "full-4k", "reachable independently compressed 4-KiB pages", 0, metrics["full-4k"].WorkingSetChunkBytes},
 		{"WS", "full-4k", "per-revision coalesced full WS in Zstd-3 frames", fullWSPayload, fullWSPayload},
-		{"No-image", "no-image-4k", "shared base/rootfs plus per-revision private/image WS in Zstd-3 frames", noImageShared + noImagePrivate, noImageShared + noImagePrivate},
-		{"SplitSnap", "partial-4k", "shared base/rootfs/images plus per-revision private WS in Zstd-3 frames", splitShared + splitPrivate, splitShared + splitPrivate},
+		{"No-image", "no-image-4k", "shared base/rootfs plus per-revision private/image WS, all in 1-MiB Zstd-3 frames", noImageShared.CompressedBytes + noImagePrivate, noImageShared.CompressedBytes + noImagePrivate},
+		{"SplitSnap", "partial-4k", "shared base/rootfs/images plus per-revision private WS, all in 1-MiB Zstd-3 frames", splitShared.CompressedBytes + splitPrivate, splitShared.CompressedBytes + splitPrivate},
 		{"Full Dedup", "full-dedup-4k", "global unique exact-content WS pages in independent Zstd-3 representation", metrics["full-dedup-4k"].WorkingSetChunkBytes, metrics["full-dedup-4k"].WorkingSetChunkBytes},
 	}
 	wsBaseline := fullWSPayload
@@ -461,11 +487,15 @@ func main() {
 		SemanticRevisions:    len(config.Workloads),
 		PageSize:             pageSize,
 		RawFullSnapshotBytes: rawFullBytes,
-		Compression:          "Zstd level 3 for independently compressed chunks/pages and 1-MiB framed coalesced working sets",
+		Compression:          "Zstd level 3 for independently compressed chunks/pages and 1-MiB framed coalesced working sets; raw shared base/image sources are normalized offline to the same 1-MiB Zstd-3 framing",
 		PersistentMetadata:   "recipe/info/snap/index/manifest metadata and MinIO internal data are excluded, matching the original notebook's payload-only accounting",
 		FullDedupBoundary:    "snapshot pages and active WS pages are globally unioned by exact raw-content hash; the separately reported WS term follows the original Figure 9 accounting and is not the transient SplitSnap-format performance-oracle view",
-		Corpora:              metrics,
-		Systems:              systems,
+		SharedSources: map[string]sharedSourceMetrics{
+			"no-image-base-rootfs":         noImageShared,
+			"splitsnap-base-rootfs-images": splitShared,
+		},
+		Corpora: metrics,
+		Systems: systems,
 	}
 	data, err := json.MarshalIndent(result, "", "  ")
 	if err != nil {

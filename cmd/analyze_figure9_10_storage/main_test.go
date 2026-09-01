@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/require"
+	"github.com/vhive-serverless/vhive/snapshotting/zstdstream"
 )
 
 func TestParseRecipeAndWorkingSet(t *testing.T) {
@@ -45,4 +46,15 @@ func TestRecipeHashForPagePFNAcrossChunkSizes(t *testing.T) {
 	require.Equal(t, "second", got)
 	_, err = recipeHashForPFN(recipe, 64, 128*1024)
 	require.Error(t, err)
+}
+
+func TestSharedSourceCompressionUsesFixedZstdSettings(t *testing.T) {
+	raw := []byte("repeated shared working-set content repeated shared working-set content")
+	payload, manifest, err := zstdstream.Encode(raw, sharedZstdFrameSize, sharedZstdLevel)
+	require.NoError(t, err)
+	require.NotEmpty(t, payload)
+	require.Equal(t, sharedZstdLevel, manifest.Level)
+	require.Equal(t, sharedZstdFrameSize, manifest.FrameSize)
+	require.Equal(t, int64(len(raw)), manifest.RawSize)
+	require.Equal(t, int64(len(payload)), manifest.CompressedSize)
 }
