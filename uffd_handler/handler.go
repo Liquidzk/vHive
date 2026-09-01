@@ -620,6 +620,12 @@ func NewUffdHandler(conn *net.UnixConn, pageOps *PageOperations, size uint64, tr
 	if err != nil {
 		return nil, fmt.Errorf("failed to get mappings and file: %w", err)
 	}
+	keepUffdFd := false
+	defer func() {
+		if !keepUffdFd {
+			_ = unix.Close(uffdFd)
+		}
+	}()
 
 	var mappings []GuestRegionUffdMapping
 	if err := json.Unmarshal([]byte(body), &mappings); err != nil {
@@ -645,14 +651,16 @@ func NewUffdHandler(conn *net.UnixConn, pageOps *PageOperations, size uint64, tr
 		return nil, fmt.Errorf("invalid page size: %d", pageSize)
 	}
 
-	return &UffdHandler{
+	handler := &UffdHandler{
 		memRegions:   mappings,
 		pageSize:     pageSize,
 		uffd:         uffdFd,
 		removedPages: make(map[uint64]bool),
 		tracer:       tracer,
 		pageOps:      pageOps,
-	}, nil
+	}
+	keepUffdFd = true
+	return handler, nil
 }
 
 // ReadEvent reads an event from the userfaultfd
@@ -1021,6 +1029,7 @@ func (r *Runtime) Run(pfEventDispatch func(*UffdHandler)) {
 							return
 						}
 						r.logger.Errorf("Failed to create UFFD handler: %v", err)
+						continue
 					}
 
 					pollfds = append(pollfds, unix.PollFd{
