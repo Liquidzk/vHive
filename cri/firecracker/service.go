@@ -25,6 +25,7 @@ package firecracker
 import (
 	"context"
 	"errors"
+	"strings"
 	"sync"
 
 	log "github.com/sirupsen/logrus"
@@ -153,13 +154,25 @@ func (fs *FirecrackerService) createUserContainer(ctx context.Context, r *criapi
 }
 
 func (fs *FirecrackerService) createQueueProxy(ctx context.Context, r *criapi.CreateContainerRequest) (*criapi.CreateContainerResponse, error) {
-	vmConfig, err := fs.getVMConfig(r.GetPodSandboxId())
-	if err != nil {
-		log.WithError(err).Error()
-		return nil, err
+	podID := r.GetPodSandboxId()
+	vmConfig, isVM := fs.lookupVMConfig(podID)
+	if !isVM {
+		isStockMultiContainer, err := fs.hasStockMultiContainerUser(ctx, podID)
+		if err != nil {
+			log.WithError(err).Error("failed to inspect stock containers before creating queue-proxy")
+			return nil, err
+		}
+		if !isStockMultiContainer {
+			err := errors.New("VM config for pod does not exist")
+			log.WithError(err).Errorf("VM config for pod %s does not exist", podID)
+			return nil, err
+		}
+
+		log.Debugf("creating stock queue-proxy for multi-container pod %s", podID)
+		return fs.stockRuntimeClient.CreateContainer(ctx, r)
 	}
 
-	fs.removeVMConfig(r.GetPodSandboxId())
+	fs.removeVMConfig(podID)
 
 	guestIPKeyVal := &criapi.KeyValue{Key: guestIPEnv, Value: vmConfig.guestIP}
 	guestPortKeyVal := &criapi.KeyValue{Key: guestPortEnv, Value: vmConfig.guestPort}
@@ -172,6 +185,27 @@ func (fs *FirecrackerService) createQueueProxy(ctx context.Context, r *criapi.Cr
 	}
 
 	return resp, nil
+}
+
+func (fs *FirecrackerService) hasStockMultiContainerUser(ctx context.Context, podID string) (bool, error) {
+	resp, err := fs.stockRuntimeClient.ListContainers(ctx, &criapi.ListContainersRequest{
+		Filter: &criapi.ContainerFilter{PodSandboxId: podID},
+	})
+	if err != nil {
+		return false, err
+	}
+
+	for _, container := range resp.GetContainers() {
+		if isStockMultiContainerUserName(container.GetMetadata().GetName()) {
+			return true, nil
+		}
+	}
+
+	return false, nil
+}
+
+func isStockMultiContainerUserName(name string) bool {
+	return strings.HasPrefix(name, userContainerName+"-")
 }
 
 func (fs *FirecrackerService) RemoveContainer(ctx context.Context, r *criapi.RemoveContainerRequest) (*criapi.RemoveContainerResponse, error) {
@@ -202,16 +236,21 @@ func (fs *FirecrackerService) removeVMConfig(podID string) {
 }
 
 func (fs *FirecrackerService) getVMConfig(podID string) (*VMConfig, error) {
-	fs.Lock()
-	defer fs.Unlock()
-
-	vmConfig, isPresent := fs.vmConfigs[podID]
+	vmConfig, isPresent := fs.lookupVMConfig(podID)
 	if !isPresent {
 		log.Errorf("VM config for pod %s does not exist", podID)
 		return nil, errors.New("VM config for pod does not exist")
 	}
 
 	return vmConfig, nil
+}
+
+func (fs *FirecrackerService) lookupVMConfig(podID string) (*VMConfig, bool) {
+	fs.Lock()
+	defer fs.Unlock()
+
+	vmConfig, isPresent := fs.vmConfigs[podID]
+	return vmConfig, isPresent
 }
 
 func getEnvVal(key string, config *criapi.ContainerConfig) (string, error) {
