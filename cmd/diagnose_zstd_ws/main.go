@@ -14,6 +14,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/klauspost/compress/zstd"
@@ -42,6 +43,7 @@ type sample struct {
 	Run                int    `json:"run"`
 	Mode               string `json:"mode"`
 	DecoderConcurrency int    `json:"decoder_concurrency,omitempty"`
+	RangeWorkers       int    `json:"range_workers,omitempty"`
 	CompressedBytes    int64  `json:"compressed_bytes"`
 	RawBytes           int64  `json:"raw_bytes"`
 	ManifestUS         int64  `json:"manifest_us,omitempty"`
@@ -219,6 +221,115 @@ func streamDecode(ctx context.Context, store *storage.MinioStorage, payloadKey s
 	}, err
 }
 
+func fetchRanges(ctx context.Context, store *storage.MinioStorage, payloadKey string, manifest *zstdstream.Manifest, workers, run int) (sample, error) {
+	if workers > len(manifest.Frames) {
+		workers = len(manifest.Frames)
+	}
+	totalStarted := time.Now()
+	started := time.Now()
+	payload := make([]byte, manifest.CompressedSize)
+	allocateElapsed := time.Since(started)
+	jobs := make(chan zstdstream.Frame)
+	errCh := make(chan error, 1)
+	var wait sync.WaitGroup
+	for range workers {
+		wait.Add(1)
+		go func() {
+			defer wait.Done()
+			for frame := range jobs {
+				reader, err := store.OpenObjectRange(ctx, payloadKey, frame.CompressedOffset, frame.CompressedSize)
+				if err == nil {
+					_, err = io.ReadFull(reader, payload[frame.CompressedOffset:frame.CompressedOffset+frame.CompressedSize])
+					closeErr := reader.Close()
+					if err == nil {
+						err = closeErr
+					}
+				}
+				if err != nil {
+					select {
+					case errCh <- err:
+					default:
+					}
+					return
+				}
+			}
+		}()
+	}
+	for _, frame := range manifest.Frames {
+		jobs <- frame
+	}
+	close(jobs)
+	wait.Wait()
+	select {
+	case err := <-errCh:
+		return sample{}, err
+	default:
+	}
+	return sample{
+		Run:             run,
+		Mode:            "framed-fetch-only",
+		RangeWorkers:    workers,
+		CompressedBytes: manifest.CompressedSize,
+		RawBytes:        manifest.RawSize,
+		CacheAllocateUS: allocateElapsed.Microseconds(),
+		ReadOrDecodeUS:  time.Since(totalStarted).Microseconds(),
+		TotalUS:         time.Since(totalStarted).Microseconds(),
+	}, nil
+}
+
+func framedDecode(ctx context.Context, store *storage.MinioStorage, payloadKey string, payload []byte, manifest *zstdstream.Manifest, workers, run int, remote bool) (sample, error) {
+	if workers > len(manifest.Frames) {
+		workers = len(manifest.Frames)
+	}
+	totalStarted := time.Now()
+	started := time.Now()
+	destination, err := unix.Mmap(-1, 0, int(manifest.RawSize), unix.PROT_READ|unix.PROT_WRITE, unix.MAP_PRIVATE|unix.MAP_ANON)
+	mmapElapsed := time.Since(started)
+	if err != nil {
+		return sample{}, err
+	}
+	defer unix.Munmap(destination)
+	var compressedCache []byte
+	var cacheElapsed time.Duration
+	if remote {
+		started = time.Now()
+		compressedCache = make([]byte, manifest.CompressedSize)
+		cacheElapsed = time.Since(started)
+	}
+	open := func(offset, length int64) (io.ReadCloser, error) {
+		if !remote {
+			return io.NopCloser(bytes.NewReader(payload[offset : offset+length])), nil
+		}
+		reader, err := store.OpenObjectRange(ctx, payloadKey, offset, length)
+		if err != nil {
+			return nil, err
+		}
+		capture := &fixedSliceWriter{data: compressedCache[offset : offset+length]}
+		return &struct {
+			io.Reader
+			io.Closer
+		}{Reader: io.TeeReader(reader, capture), Closer: reader}, nil
+	}
+	started = time.Now()
+	err = zstdstream.Decode(ctx, manifest, open, destination, workers)
+	decodeElapsed := time.Since(started)
+	mode := "framed-memory-decode"
+	if remote {
+		mode = "framed-stream-decode"
+	}
+	return sample{
+		Run:               run,
+		Mode:              mode,
+		RangeWorkers:      workers,
+		CompressedBytes:   manifest.CompressedSize,
+		RawBytes:          manifest.RawSize,
+		DestinationMmapUS: mmapElapsed.Microseconds(),
+		CacheAllocateUS:   cacheElapsed.Microseconds(),
+		ReadOrDecodeUS:    decodeElapsed.Microseconds(),
+		TotalUS:           time.Since(totalStarted).Microseconds(),
+	}, err
+}
+
 func main() {
 	endpoint := flag.String("minioURL", "", "MinIO endpoint without scheme")
 	accessKey := flag.String("minioAccessKey", "minio", "MinIO access key")
@@ -255,9 +366,6 @@ func main() {
 		if err != nil {
 			panic(err)
 		}
-		if len(manifest.Frames) != 1 {
-			panic(fmt.Errorf("expected one frame, found %d", len(manifest.Frames)))
-		}
 		payload, fetchSample, err := fetchOnly(ctx, store, payloadKey, manifest, run)
 		if err != nil {
 			panic(err)
@@ -270,6 +378,28 @@ func main() {
 			}
 		}
 		for _, concurrency := range concurrencies {
+			if len(manifest.Frames) > 1 {
+				fetchRangesSample, err := fetchRanges(ctx, store, payloadKey, manifest, concurrency, run)
+				if err != nil {
+					panic(err)
+				}
+				memorySample, err := framedDecode(ctx, store, payloadKey, payload, manifest, concurrency, run, false)
+				if err != nil {
+					panic(err)
+				}
+				streamSample, err := framedDecode(ctx, store, payloadKey, payload, manifest, concurrency, run, true)
+				if err != nil {
+					panic(err)
+				}
+				if iteration >= 0 {
+					for _, current := range []sample{fetchRangesSample, memorySample, streamSample} {
+						if err := encoder.Encode(current); err != nil {
+							panic(err)
+						}
+					}
+				}
+				continue
+			}
 			memorySample, err := memoryDecode(payload, manifest, concurrency, run)
 			if err != nil {
 				panic(err)
