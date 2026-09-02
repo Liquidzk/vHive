@@ -1,7 +1,7 @@
-// Package zstdstream implements a seekable, independently framed Zstandard
-// representation.  Each frame can be fetched and decoded without waiting for
-// earlier frames, which lets SnapShare overlap parallel object-store reads
-// with decompression while still reconstructing one contiguous byte range.
+// Package zstdstream implements both a single ordered Zstandard stream and a
+// seekable, independently framed representation.  Independent frames can be
+// fetched and decoded without waiting for earlier frames, while a one-frame
+// manifest preserves the sequential topology of a coalesced working set.
 package zstdstream
 
 import (
@@ -180,6 +180,19 @@ func Encode(raw []byte, frameSize int64, level int) ([]byte, *Manifest, error) {
 		return nil, nil, fmt.Errorf("validate encoded zstd frames: %w", err)
 	}
 	return payload, manifest, nil
+}
+
+// EncodeSingle stores raw as one ordered Zstandard stream.  Restore can feed
+// the corresponding object reader directly into one decoder, so object
+// retrieval and decompression overlap without allowing out-of-order ranges.
+func EncodeSingle(raw []byte, level int) ([]byte, *Manifest, error) {
+	frameSize := int64(len(raw))
+	if frameSize == 0 {
+		// Manifest validation requires a positive maximum frame size even when
+		// the payload contains no frames.
+		frameSize = 1
+	}
+	return Encode(raw, frameSize, level)
 }
 
 // Decode fetches and decompresses independent frames concurrently.  Each

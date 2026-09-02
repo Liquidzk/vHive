@@ -77,6 +77,8 @@ const (
 	deleteBatchSize            = 150 // TODO: tune
 	CompressionCodecNone       = "none"
 	CompressionCodecZstd       = "zstd"
+	CompressionLayoutSingle    = "single"
+	CompressionLayoutFramed    = "framed"
 	DefaultZstdLevel           = 3
 	DefaultZstdFrameSize       = 1024 * 1024
 	DefaultZstdFetchers        = 10
@@ -119,6 +121,7 @@ type CompressionConfig struct {
 	Chunks     bool
 	Codec      string
 	Level      int
+	WSLayout   string
 	FrameSize  int64
 	Fetchers   int
 }
@@ -127,6 +130,7 @@ func DefaultCompressionConfig() CompressionConfig {
 	return CompressionConfig{
 		Codec:     CompressionCodecNone,
 		Level:     DefaultZstdLevel,
+		WSLayout:  CompressionLayoutSingle,
 		FrameSize: DefaultZstdFrameSize,
 		Fetchers:  DefaultZstdFetchers,
 	}
@@ -965,6 +969,10 @@ func NewSnapshotManager(baseFolder string, store storage.ObjectStorage, chunking
 // default keeps the historical raw layout untouched.
 func (mgr *SnapshotManager) ConfigureCompression(config CompressionConfig) error {
 	config.Codec = strings.ToLower(strings.TrimSpace(config.Codec))
+	config.WSLayout = strings.ToLower(strings.TrimSpace(config.WSLayout))
+	if config.WSLayout == "" {
+		config.WSLayout = CompressionLayoutSingle
+	}
 	if !config.WorkingSet && !config.Chunks {
 		config.Codec = CompressionCodecNone
 	}
@@ -976,6 +984,9 @@ func (mgr *SnapshotManager) ConfigureCompression(config CompressionConfig) error
 	}
 	if (config.WorkingSet || config.Chunks) && config.Codec != CompressionCodecZstd {
 		return fmt.Errorf("enabled compression requires codec %q", CompressionCodecZstd)
+	}
+	if config.WSLayout != CompressionLayoutSingle && config.WSLayout != CompressionLayoutFramed {
+		return fmt.Errorf("unsupported working-set compression layout %q", config.WSLayout)
 	}
 	if config.FrameSize <= 0 {
 		return fmt.Errorf("compression frame size must be positive")
@@ -1821,10 +1832,11 @@ func (mgr *SnapshotManager) UploadWorkingSet(revision string) error {
 }
 
 // persistWorkingSetContent writes either the historical raw representation or
-// an independently framed Zstandard representation.  For Zstandard, the
-// payload is uploaded first and the validated manifest last as the commit
-// marker; a restore configured for compression never silently falls back to a
-// raw object.
+// a Zstandard representation.  The default single layout keeps one ordered
+// stream for the coalesced working set; the framed layout is retained for
+// compatibility and explicit experiments.  The payload is uploaded first and
+// the validated manifest last as the commit marker; a restore configured for
+// compression never silently falls back to a raw object.
 func (mgr *SnapshotManager) persistWorkingSetContent(revision, rawPath string, content []byte) error {
 	if !mgr.compression.WorkingSet {
 		if err := os.WriteFile(rawPath, content, 0644); err != nil {
@@ -1834,32 +1846,39 @@ func (mgr *SnapshotManager) persistWorkingSetContent(revision, rawPath string, c
 	}
 
 	started := time.Now()
-	payload, manifest, err := zstdstream.Encode(content, mgr.compression.FrameSize, mgr.compression.Level)
+	var payload []byte
+	var manifest *zstdstream.Manifest
+	var err error
+	if mgr.compression.WSLayout == CompressionLayoutSingle {
+		payload, manifest, err = zstdstream.EncodeSingle(content, mgr.compression.Level)
+	} else {
+		payload, manifest, err = zstdstream.Encode(content, mgr.compression.FrameSize, mgr.compression.Level)
+	}
 	if err != nil {
-		return errors.Wrap(err, "encode framed zstd working set")
+		return errors.Wrap(err, "encode zstd working set")
 	}
 	manifestData, err := zstdstream.MarshalManifest(manifest)
 	if err != nil {
-		return errors.Wrap(err, "serialize framed zstd manifest")
+		return errors.Wrap(err, "serialize zstd working-set manifest")
 	}
 	payloadPath := workingSetZstdPayloadPath(rawPath)
 	manifestPath := workingSetZstdManifestPath(rawPath)
 	if err := os.WriteFile(payloadPath, payload, 0644); err != nil {
-		return errors.Wrap(err, "write framed zstd payload")
+		return errors.Wrap(err, "write zstd working-set payload")
 	}
 	if err := os.WriteFile(manifestPath, manifestData, 0644); err != nil {
-		return errors.Wrap(err, "write framed zstd manifest")
+		return errors.Wrap(err, "write zstd working-set manifest")
 	}
 	if err := mgr.uploadFile(revision, payloadPath); err != nil {
-		return errors.Wrap(err, "upload framed zstd payload")
+		return errors.Wrap(err, "upload zstd working-set payload")
 	}
 	if err := mgr.uploadFile(revision, manifestPath); err != nil {
-		return errors.Wrap(err, "upload framed zstd manifest")
+		return errors.Wrap(err, "upload zstd working-set manifest")
 	}
 	_ = os.Remove(rawPath)
-	log.Infof("ZSTD_WS_ENCODE revision=%s raw_bytes=%d compressed_bytes=%d frames=%d level=%d frame_size=%d elapsed_us=%d",
-		revision, len(content), len(payload), len(manifest.Frames), mgr.compression.Level,
-		mgr.compression.FrameSize, time.Since(started).Microseconds())
+	log.Infof("ZSTD_WS_ENCODE revision=%s layout=%s raw_bytes=%d compressed_bytes=%d frames=%d level=%d frame_size=%d elapsed_us=%d",
+		revision, mgr.compression.WSLayout, len(content), len(payload), len(manifest.Frames), mgr.compression.Level,
+		manifest.FrameSize, time.Since(started).Microseconds())
 	return nil
 }
 
@@ -3179,6 +3198,13 @@ func (mgr *SnapshotManager) getWorkingSetPathManaged(snap *Snapshot, rawPath str
 	if manifest.RawSize == 0 {
 		return []byte{}, func() {}, nil
 	}
+	manifestLayout := CompressionLayoutSingle
+	if len(manifest.Frames) > 1 {
+		manifestLayout = CompressionLayoutFramed
+	}
+	if manifestLayout != mgr.compression.WSLayout {
+		return nil, func() {}, fmt.Errorf("compressed working-set layout %q does not match configured layout %q", manifestLayout, mgr.compression.WSLayout)
+	}
 	if manifest.RawSize > int64(^uint(0)>>1) {
 		return nil, func() {}, fmt.Errorf("compressed working set raw size %d exceeds addressable memory", manifest.RawSize)
 	}
@@ -3246,7 +3272,11 @@ func (mgr *SnapshotManager) getWorkingSetPathManaged(snap *Snapshot, rawPath str
 		return io.NopCloser(bytes.NewReader(fallbackPayload[offset : offset+length])), nil
 	}
 
-	if err := zstdstream.Decode(context.Background(), manifest, openRange, destination, mgr.compression.Fetchers); err != nil {
+	decodeWorkers := mgr.compression.Fetchers
+	if decodeWorkers > len(manifest.Frames) {
+		decodeWorkers = len(manifest.Frames)
+	}
+	if err := zstdstream.Decode(context.Background(), manifest, openRange, destination, decodeWorkers); err != nil {
 		release()
 		return nil, func() {}, errors.Wrap(err, "stream-decode compressed working set")
 	}
@@ -3272,9 +3302,9 @@ func (mgr *SnapshotManager) getWorkingSetPathManaged(snap *Snapshot, rawPath str
 		}
 	}
 	mgr.registerWorkingSetAccessForPath(payloadPath)
-	log.Infof("ZSTD_WS_DECODE revision=%s source=%s raw_bytes=%d compressed_bytes=%d frames=%d fetchers=%d elapsed_us=%d",
-		snap.GetId(), map[bool]string{true: "local", false: "remote"}[localPayload], manifest.RawSize,
-		manifest.CompressedSize, len(manifest.Frames), mgr.compression.Fetchers, time.Since(started).Microseconds())
+	log.Infof("ZSTD_WS_DECODE revision=%s source=%s layout=%s raw_bytes=%d compressed_bytes=%d frames=%d fetchers=%d elapsed_us=%d",
+		snap.GetId(), map[bool]string{true: "local", false: "remote"}[localPayload], manifestLayout, manifest.RawSize,
+		manifest.CompressedSize, len(manifest.Frames), decodeWorkers, time.Since(started).Microseconds())
 	return destination, release, nil
 }
 

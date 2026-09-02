@@ -16,9 +16,10 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/require"
+	"github.com/vhive-serverless/vhive/snapshotting/zstdstream"
 )
 
-func TestZstdWorkingSetRemoteRangeRoundTrip(t *testing.T) {
+func TestZstdWorkingSetRemoteSingleStreamRoundTrip(t *testing.T) {
 	store := newMemoryRangeStorage()
 	base := t.TempDir()
 	mgr := NewSnapshotManager(base, store, true, false, true, true, true, false,
@@ -40,6 +41,41 @@ func TestZstdWorkingSetRemoteRangeRoundTrip(t *testing.T) {
 
 	_, rawUploaded := store.get(mgr.getObjectKey(snap.GetId(), filepath.Base(rawPath)))
 	require.False(t, rawUploaded, "compressed mode must not publish a raw fallback")
+	manifestData, manifestUploaded := store.get(mgr.getObjectKey(snap.GetId(), filepath.Base(workingSetZstdManifestPath(rawPath))))
+	require.True(t, manifestUploaded)
+	manifest, err := zstdstream.ParseManifest(manifestData)
+	require.NoError(t, err)
+	require.Len(t, manifest.Frames, 1, "single layout must encode the complete coalesced WS as one Zstd frame")
+	require.NoError(t, os.Remove(workingSetZstdPayloadPath(rawPath)))
+	require.NoError(t, os.Remove(workingSetZstdManifestPath(rawPath)))
+
+	decoded, release, err := mgr.getWorkingSetPathManaged(snap, rawPath)
+	require.NoError(t, err)
+	defer release()
+	require.Equal(t, raw, decoded)
+	require.Equal(t, 1, store.rangeOpenCount())
+}
+
+func TestZstdWorkingSetRemoteFramedRoundTrip(t *testing.T) {
+	store := newMemoryRangeStorage()
+	base := t.TempDir()
+	mgr := NewSnapshotManager(base, store, true, false, true, true, true, false,
+		4096, 1024*1024, SecurityModePartial, 4, false, true)
+	require.NoError(t, mgr.ConfigureCompression(CompressionConfig{
+		WorkingSet: true,
+		Codec:      CompressionCodecZstd,
+		Level:      3,
+		WSLayout:   CompressionLayoutFramed,
+		FrameSize:  64 * 1024,
+		Fetchers:   4,
+	}))
+
+	snap, err := mgr.InitSnapshot("zstd-ws-framed-test", "test-image")
+	require.NoError(t, err)
+	raw := bytes.Repeat([]byte("private-working-set-page-content"), 16384)
+	raw = raw[:len(raw)/4096*4096]
+	rawPath := snap.GetWSPrivateContentFilePath()
+	require.NoError(t, mgr.persistWorkingSetContent(snap.GetId(), rawPath, raw))
 	require.NoError(t, os.Remove(workingSetZstdPayloadPath(rawPath)))
 	require.NoError(t, os.Remove(workingSetZstdManifestPath(rawPath)))
 
@@ -48,6 +84,41 @@ func TestZstdWorkingSetRemoteRangeRoundTrip(t *testing.T) {
 	defer release()
 	require.Equal(t, raw, decoded)
 	require.Greater(t, store.rangeOpenCount(), 1)
+}
+
+func TestZstdWorkingSetLayoutMismatchFailsClosed(t *testing.T) {
+	store := newMemoryRangeStorage()
+	base := t.TempDir()
+	uploader := NewSnapshotManager(base, store, true, false, true, true, true, false,
+		4096, 1024*1024, SecurityModePartial, 4, false, true)
+	require.NoError(t, uploader.ConfigureCompression(CompressionConfig{
+		WorkingSet: true,
+		Codec:      CompressionCodecZstd,
+		Level:      3,
+		WSLayout:   CompressionLayoutFramed,
+		FrameSize:  64 * 1024,
+		Fetchers:   4,
+	}))
+	snap, err := uploader.InitSnapshot("zstd-ws-layout-mismatch", "test-image")
+	require.NoError(t, err)
+	raw := bytes.Repeat([]byte("layout-mismatch-page"), 32768)
+	raw = raw[:len(raw)/4096*4096]
+	rawPath := snap.GetWSPrivateContentFilePath()
+	require.NoError(t, uploader.persistWorkingSetContent(snap.GetId(), rawPath, raw))
+
+	receiver := NewSnapshotManager(base, store, true, false, true, true, true, false,
+		4096, 1024*1024, SecurityModePartial, 4, false, true)
+	require.NoError(t, receiver.ConfigureCompression(CompressionConfig{
+		WorkingSet: true,
+		Codec:      CompressionCodecZstd,
+		Level:      3,
+		WSLayout:   CompressionLayoutSingle,
+		FrameSize:  64 * 1024,
+		Fetchers:   4,
+	}))
+	_, release, err := receiver.getWorkingSetPathManaged(snap, rawPath)
+	release()
+	require.ErrorContains(t, err, "layout \"framed\" does not match configured layout \"single\"")
 }
 
 func TestZstdWorkingSetFailsClosedWithoutManifest(t *testing.T) {
