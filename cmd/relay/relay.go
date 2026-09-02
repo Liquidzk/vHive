@@ -285,11 +285,14 @@ func handler(w http.ResponseWriter, r *http.Request) {
 	} else if *baseSnap { // start from base snapshot case
 		log.Debugf("No snapshot for rev %s, starting from base snapshot", rev)
 		resp, err = orch.StartWithBaseSnapshot(ctx, image, envArr, argsArr)
-		time.Sleep(2 * time.Second)
+		// Source creation is outside the measured restore window. Match the
+		// historical snap_benchmark source path, which allowed the guest and
+		// function server ten seconds to start before issuing the first request.
+		time.Sleep(10 * time.Second)
 	} else { // boot case
 		log.Debugf("No snapshot for rev %s, starting from image", rev)
 		resp, _, err = orch.StartVMWithEnvironment(ctx, image, envArr, argsArr)
-		time.Sleep(2 * time.Second)
+		time.Sleep(10 * time.Second)
 	}
 	if err != nil {
 		http.Error(w, fmt.Sprintf("Server Error: %v", err), http.StatusInternalServerError)
