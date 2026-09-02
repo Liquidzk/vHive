@@ -35,13 +35,14 @@ var (
 )
 
 var (
-	orch       *ctriface.Orchestrator
-	snapMgr    *snapshotting.SnapshotManager
-	imageMap   map[string]string
-	mu         = &sync.Mutex{}
-	cleaning   *bool
-	baseSnap   *bool
-	dropCaches *bool
+	orch             *ctriface.Orchestrator
+	snapMgr          *snapshotting.SnapshotManager
+	imageMap         map[string]string
+	mu               = &sync.Mutex{}
+	cleaning         *bool
+	baseSnap         *bool
+	dropCaches       *bool
+	freshSourceDelay *time.Duration
 )
 
 const (
@@ -288,11 +289,13 @@ func handler(w http.ResponseWriter, r *http.Request) {
 		// Source creation is outside the measured restore window. Match the
 		// historical snap_benchmark source path, which allowed the guest and
 		// function server ten seconds to start before issuing the first request.
-		time.Sleep(10 * time.Second)
+		// Newly added, heavier functions may explicitly request a longer fixed
+		// source-only delay; snapshot restores never execute this branch.
+		time.Sleep(*freshSourceDelay)
 	} else { // boot case
 		log.Debugf("No snapshot for rev %s, starting from image", rev)
 		resp, _, err = orch.StartVMWithEnvironment(ctx, image, envArr, argsArr)
-		time.Sleep(10 * time.Second)
+		time.Sleep(*freshSourceDelay)
 	}
 	if err != nil {
 		http.Error(w, fmt.Sprintf("Server Error: %v", err), http.StatusInternalServerError)
@@ -466,9 +469,13 @@ func main() {
 	security := flag.String("security", snapshotting.SecurityModeNone,
 		"Snapshot security mode: none, full-dedup, partial, no-image-sharing, full")
 	baseSnap = flag.Bool("baseSnap", false, "Use base snapshot of booted VM for snapshot creation")
+	freshSourceDelay = flag.Duration("freshSourceDelay", 10*time.Second, "Fixed delay before the first invocation of a fresh image/base source; not used for snapshot restores")
 	threads := flag.Int("j", 8, "How many concurrent uploads/downloads to run when transferring snapshots")
 	encryption := flag.Bool("encryption", false, "Enable snapshot encryption")
 	flag.Parse()
+	if *freshSourceDelay < 0 {
+		log.Fatal("freshSourceDelay must not be negative")
+	}
 	if *vmMemSizeMib == 0 || uint64(*vmMemSizeMib) > uint64(^uint32(0)) {
 		log.Fatalf("vmMemSizeMib must be between 1 and %d", uint64(^uint32(0)))
 	}
