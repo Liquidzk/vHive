@@ -37,7 +37,7 @@ func WithTestModeOn(testModeOn bool) OrchestratorOption {
 	return func(o *Orchestrator) {
 		if !testModeOn {
 			o.setupCloseHandler()
-			o.setupHeartbeat()
+			o.heartbeatEnabled = true
 		}
 	}
 }

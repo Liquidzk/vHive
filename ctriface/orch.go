@@ -308,6 +308,7 @@ func (sp *ShimPool) GetPoolStats() (available int) {
 type Orchestrator struct {
 	vmPool            *misc.VMPool
 	shimPool          *ShimPool
+	heartbeatEnabled  bool
 	cachedImages      map[string]containerd.Image
 	workloadIo        sync.Map // vmID string -> WorkloadIoWriter
 	snapshotter       string
@@ -381,6 +382,9 @@ func NewOrchestrator(snapshotter, hostIface string, opts ...OrchestratorOption) 
 	}
 
 	o.vmPool = misc.NewVMPool(hostIface, o.netPoolSize, o.vethPrefix, o.clonePrefix)
+	if o.heartbeatEnabled {
+		o.setupHeartbeat()
+	}
 
 	if _, err := os.Stat(o.snapshotsDir); err != nil {
 		if !os.IsNotExist(err) {
