@@ -15,8 +15,13 @@
 snapshot/WS、数据库 dump、镜像 tar、新编译二进制或 Release 附件。**
 旧归档继续留在本地；新跑应现场生成这些文件。
 
-已经本地构建过 relay，并通过 zstdstreams、aliases、transcode 的 focused tests。
-这不等于新集群 103 点已重跑。特别是旧 runner 仍有固定节点/目录和验收材料依赖，
+已从 GitHub HTTPS 独立 shallow clone publication
+`437fd7480304ee211ff9dad828ed5e363560434a` 和 pinned direct-invoker，未使用本地
+worktree overlay：`build.sh` 的 15 个工具全部构建成功；zstdstreams、aliases、
+transcode 三组 focused tests 通过；第 3 节列出的九个既有 LFS runtime/guest 文件
+均实际下载成功；`build-guest.sh` 使用新生成的测试公钥完成 SquashFS 派生打包。
+这只验证构建/打包，未验证新 guest 启动，也不等于新集群 103 点已重跑。
+后续文档与 executable-mode 提交不更改上述受测源码。旧 runner 仍有固定节点/目录和验收材料依赖，
 第 6 节列出迁移项。**目前是可获取的源码与重建路线，不是一键新节点 installer，
 也不能据此声称“只 clone 后运行原 run_matrix.py 就能完成实验”。**
 

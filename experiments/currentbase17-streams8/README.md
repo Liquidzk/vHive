@@ -1,5 +1,11 @@
 # currentbase17：八长 Range / 八 decoder 主实验
 
+## 远程源码交付（2026-10-06）
+
+新节点重建/重跑先读 [远程源码指南](../../docs/SPLITSNAP_REMOTE_REPRODUCTION.md)。
+源码已独立从 GitHub 拉取并完成 15 工具构建；新集群配置迁移和 E2E 验证仍待完成。
+以下 9 月条目是旧实验历史，results/provenance 不随本次源码发布。
+
 ## 当前交付（2026-09-11）
 
 gate12完整103/103点、6,180calls/3,090measured已完成，controller退出0。
